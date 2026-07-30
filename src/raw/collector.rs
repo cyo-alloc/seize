@@ -43,7 +43,11 @@ pub struct Collector {
 impl Collector {
     /// Create a collector with the provided batch size and initial thread
     /// count, allocating in the given allocator.
-    pub fn new(threads: usize, batch_size: usize, alloc: DynAlloc) -> Result<Self, AllocError> {
+    pub(crate) fn new(
+        threads: usize,
+        batch_size: usize,
+        alloc: DynAlloc,
+    ) -> Result<Self, AllocError> {
         // A counter for collector IDs.
         static ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,7 +62,7 @@ impl Collector {
 
     /// Returns a reference to the allocator used by this collector.
     #[inline]
-    pub fn allocator(&self) -> &DynAlloc {
+    pub(crate) fn allocator(&self) -> &DynAlloc {
         &self.alloc
     }
 
@@ -589,7 +593,9 @@ impl Batch {
     #[inline]
     fn new(capacity: usize, alloc: DynAlloc) -> Result<Batch, AllocError> {
         let mut entries = Vec::new_in(alloc);
-        entries.try_reserve_exact(capacity).map_err(|_| AllocError)?;
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocError)?;
 
         Ok(Batch {
             entries,

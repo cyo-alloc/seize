@@ -354,18 +354,20 @@ fn recursive_retire() {
     });
 
     unsafe {
-        collector.retire(ptr, |ptr: *mut Recursive, collector| {
-            let value = Box::from_raw(ptr);
+        collector
+            .retire(ptr, |ptr: *mut Recursive, collector| {
+                let value = Box::from_raw(ptr);
 
-            for pointer in value.pointers {
-                collector.retire(pointer, reclaim::boxed).unwrap();
+                for pointer in value.pointers {
+                    collector.retire(pointer, reclaim::boxed).unwrap();
 
-                let mut guard = collector.enter().unwrap();
-                guard.flush();
-                guard.refresh();
-                drop(guard);
-            }
-        }).unwrap();
+                    let mut guard = collector.enter().unwrap();
+                    guard.flush();
+                    guard.refresh();
+                    drop(guard);
+                }
+            })
+            .unwrap();
 
         collector.enter().unwrap().flush();
     }
@@ -383,7 +385,11 @@ fn reclaim_all() {
             .collect::<Vec<_>>();
 
         for item in items {
-            unsafe { collector.retire(item.load(Ordering::Relaxed), reclaim::boxed).unwrap() };
+            unsafe {
+                collector
+                    .retire(item.load(Ordering::Relaxed), reclaim::boxed)
+                    .unwrap()
+            };
         }
 
         unsafe { collector.reclaim_all() };
@@ -409,12 +415,14 @@ fn recursive_retire_reclaim_all() {
                 .collect(),
         });
 
-        collector.retire(ptr, |ptr: *mut Recursive, collector| {
-            let value = Box::from_raw(ptr);
-            for pointer in value.pointers {
-                (*collector).retire(pointer, reclaim::boxed).unwrap();
-            }
-        }).unwrap();
+        collector
+            .retire(ptr, |ptr: *mut Recursive, collector| {
+                let value = Box::from_raw(ptr);
+                for pointer in value.pointers {
+                    (*collector).retire(pointer, reclaim::boxed).unwrap();
+                }
+            })
+            .unwrap();
 
         collector.reclaim_all();
         assert_eq!(dropped.load(Ordering::Relaxed), cfg::ITEMS);
@@ -607,7 +615,11 @@ fn owned_guard() {
 
         let guard2 = collector.enter().unwrap();
         for object in objects.0.iter() {
-            unsafe { guard2.defer_retire(object.load(Ordering::Acquire), reclaim::boxed).unwrap() }
+            unsafe {
+                guard2
+                    .defer_retire(object.load(Ordering::Acquire), reclaim::boxed)
+                    .unwrap()
+            }
         }
 
         drop(guard2);
@@ -654,7 +666,11 @@ fn owned_guard_concurrent() {
             s.spawn(move || {
                 barrier.wait();
 
-                unsafe { guard.defer_retire(objects.0[i].load(Ordering::Acquire), reclaim::boxed).unwrap() };
+                unsafe {
+                    guard
+                        .defer_retire(objects.0[i].load(Ordering::Acquire), reclaim::boxed)
+                        .unwrap()
+                };
 
                 guard.flush();
 
@@ -1244,7 +1260,10 @@ fn pressure_stack_stress() {
     assert!(stack.head.load(Ordering::Relaxed).is_null());
 
     // Every value that was pushed was popped, and dropped exactly once.
-    assert_eq!(dropped.load(Ordering::Relaxed), pushed.load(Ordering::Relaxed));
+    assert_eq!(
+        dropped.load(Ordering::Relaxed),
+        pushed.load(Ordering::Relaxed)
+    );
 
     // Safety: All threads have finished and all guards have been dropped, so
     // the stashed nodes are unreachable.

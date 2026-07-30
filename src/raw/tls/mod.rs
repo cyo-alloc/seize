@@ -57,7 +57,10 @@ unsafe impl<T: Send> Sync for ThreadLocal<T> {}
 impl<T> ThreadLocal<T> {
     /// Create a `ThreadLocal` container with the given initial capacity,
     /// allocating in the given allocator.
-    pub fn with_capacity_in(capacity: usize, alloc: DynAlloc) -> Result<ThreadLocal<T>, AllocError> {
+    pub(crate) fn with_capacity_in(
+        capacity: usize,
+        alloc: DynAlloc,
+    ) -> Result<ThreadLocal<T>, AllocError> {
         let init = match capacity {
             0 => 0,
             // Initialize enough buckets for `capacity` elements.
@@ -121,11 +124,7 @@ impl<T> ThreadLocal<T> {
     /// The current thread must have unique access to the slot for the given
     /// `thread`.
     #[inline]
-    pub unsafe fn load_or(
-        &self,
-        create: impl Fn() -> T,
-        thread: Thread,
-    ) -> Result<&T, AllocError> {
+    pub unsafe fn load_or(&self, create: impl Fn() -> T, thread: Thread) -> Result<&T, AllocError> {
         // Safety: `thread.bucket` is always in bounds.
         let bucket = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let mut bucket_ptr = bucket.load(Ordering::Acquire);
@@ -227,28 +226,30 @@ impl<T> ThreadLocal<T> {
         let capacity = Thread::bucket_capacity(thread.bucket);
         let new_bucket = allocate_bucket::<T>(&self.alloc, capacity)?;
 
-        Ok(match bucket.compare_exchange(
-            ptr::null_mut(),
-            new_bucket,
-            // Release: If we win the race, synchronize with Acquire loads of the bucket from other
-            // threads.
-            Ordering::Release,
-            // Acquire: If we lose the race, synchronize with the initialization of the bucket that
-            // won.
-            Ordering::Acquire,
-        ) {
-            // We won the race and initialized the bucket.
-            Ok(_) => new_bucket,
+        Ok(
+            match bucket.compare_exchange(
+                ptr::null_mut(),
+                new_bucket,
+                // Release: If we win the race, synchronize with Acquire loads of the bucket from other
+                // threads.
+                Ordering::Release,
+                // Acquire: If we lose the race, synchronize with the initialization of the bucket that
+                // won.
+                Ordering::Acquire,
+            ) {
+                // We won the race and initialized the bucket.
+                Ok(_) => new_bucket,
 
-            // We lost the race and can use the bucket that was stored instead.
-            Err(other) => unsafe {
-                // Safety: The pointer has not been shared, so none of its entries were
-                // initialized.
-                free_bucket::<T>(&self.alloc, new_bucket, capacity);
+                // We lost the race and can use the bucket that was stored instead.
+                Err(other) => unsafe {
+                    // Safety: The pointer has not been shared, so none of its entries were
+                    // initialized.
+                    free_bucket::<T>(&self.alloc, new_bucket, capacity);
 
-                other
+                    other
+                },
             },
-        })
+        )
     }
 
     /// Returns an iterator over all active thread slots.
@@ -513,7 +514,9 @@ mod tests {
         let dropped = Arc::new(AtomicUsize::new(0));
         // Safety: Loading with `Thread::current` is always sound.
         unsafe {
-            local.load_or(|| Dropped(dropped.clone()), Thread::current()).unwrap();
+            local
+                .load_or(|| Dropped(dropped.clone()), Thread::current())
+                .unwrap();
         }
         assert_eq!(dropped.load(Relaxed), 0);
         drop(local);
