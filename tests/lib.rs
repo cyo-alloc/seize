@@ -5,7 +5,7 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 
 #[test]
@@ -770,6 +770,488 @@ fn owned_stress() {
         assert!(stack.pop(&stack.collector.enter_owned().unwrap()).is_none());
         assert!(stack.is_empty());
     }
+}
+
+/// The state shared with a `FlakyAlloc`.
+#[derive(Default)]
+struct FlakyState {
+    allocations: AtomicUsize,
+    failures: AtomicUsize,
+    live: AtomicUsize,
+    failing: AtomicBool,
+}
+
+/// An allocator that rejects a fixed fraction of allocations, simulating
+/// intermittent memory pressure.
+///
+/// Whether an allocation is rejected is decided by hashing its index, rather
+/// than by sampling a random source, so the failure pattern is fixed for a
+/// given sequence of allocations.
+#[derive(Clone)]
+struct FlakyAlloc {
+    state: Arc<FlakyState>,
+    fail_percent: u64,
+}
+
+impl FlakyAlloc {
+    /// Create an allocator that rejects `fail_percent` percent of allocations
+    /// once memory pressure is enabled.
+    fn new(fail_percent: u64) -> FlakyAlloc {
+        FlakyAlloc {
+            state: Arc::default(),
+            fail_percent,
+        }
+    }
+
+    /// Set whether allocations may be rejected.
+    fn set_failing(&self, failing: bool) {
+        self.state.failing.store(failing, Ordering::Relaxed);
+    }
+
+    /// Returns the number of allocations that were rejected.
+    fn failures(&self) -> usize {
+        self.state.failures.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of bytes allocated and not yet freed.
+    fn live(&self) -> usize {
+        self.state.live.load(Ordering::Relaxed)
+    }
+}
+
+// Safety: Allocations are either forwarded to the global allocator or rejected,
+// and deallocation always succeeds.
+unsafe impl Allocator for FlakyAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let index = self.state.allocations.fetch_add(1, Ordering::Relaxed) as u64;
+
+        // Hash the index to avoid the failure pattern resonating with the
+        // allocation pattern of the collector.
+        if self.state.failing.load(Ordering::Relaxed)
+            && (index.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) % 100 < self.fail_percent
+        {
+            self.state.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(AllocError);
+        }
+
+        let ptr = Global.allocate(layout)?;
+        self.state.live.fetch_add(layout.size(), Ordering::Relaxed);
+        Ok(ptr)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.state.live.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+/// The state shared with a `BudgetAlloc`.
+#[derive(Default)]
+struct BudgetState {
+    live: AtomicUsize,
+    budget: AtomicUsize,
+}
+
+/// An allocator with a fixed memory budget, rejecting any allocation that would
+/// exceed it.
+#[derive(Clone, Default)]
+struct BudgetAlloc(Arc<BudgetState>);
+
+impl BudgetAlloc {
+    /// Create an allocator that can allocate at most `budget` bytes at a time.
+    fn new(budget: usize) -> BudgetAlloc {
+        let alloc = BudgetAlloc::default();
+        alloc.set_budget(budget);
+        alloc
+    }
+
+    /// Set the number of bytes this allocator may keep live.
+    fn set_budget(&self, budget: usize) {
+        self.0.budget.store(budget, Ordering::Relaxed);
+    }
+
+    /// Returns the number of bytes allocated and not yet freed.
+    fn live(&self) -> usize {
+        self.0.live.load(Ordering::Relaxed)
+    }
+}
+
+// Safety: Allocations are either forwarded to the global allocator or rejected,
+// and deallocation always succeeds.
+unsafe impl Allocator for BudgetAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // Claim the memory before allocating it, ensuring that concurrent
+        // allocations can never exceed the budget between the check and the
+        // allocation.
+        self.0
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                let live = live.checked_add(layout.size())?;
+                (live <= self.0.budget.load(Ordering::Relaxed)).then_some(live)
+            })
+            .map_err(|_| AllocError)?;
+
+        match Global.allocate(layout) {
+            Ok(ptr) => Ok(ptr),
+            Err(err) => {
+                // Release the claim if the underlying allocation failed.
+                self.0.live.fetch_sub(layout.size(), Ordering::Release);
+                Err(err)
+            }
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.0.live.fetch_sub(layout.size(), Ordering::Release);
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+/// The outcome of retiring values under memory pressure.
+#[derive(Default)]
+struct Pressure {
+    /// The number of values that were created.
+    created: AtomicUsize,
+
+    /// The number of operations that failed to allocate.
+    rejected: AtomicUsize,
+}
+
+/// Retire `items` values through guards created by `enter`, tolerating
+/// allocation failure at every step.
+///
+/// Values that could not be retired are freed directly, which is sound because
+/// they were never shared with another thread. Note that a value is only
+/// created if a guard could be entered, so the number of values created is
+/// recorded rather than assumed.
+fn retire_under_pressure<G>(
+    items: usize,
+    dropped: &Arc<AtomicUsize>,
+    pressure: &Pressure,
+    mut enter: impl FnMut() -> Result<G, AllocError>,
+) where
+    G: Guard,
+{
+    for _ in 0..items {
+        // Entering the collector allocates thread-local storage the first time
+        // it is called on a thread, and so can fail under memory pressure.
+        let Ok(guard) = enter() else {
+            pressure.rejected.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+
+        let value = boxed(DropTrack(dropped.clone()));
+        pressure.created.fetch_add(1, Ordering::Relaxed);
+
+        // Safety: The value was never shared, and was allocated with `Box`.
+        if unsafe { guard.defer_retire(value, reclaim::boxed) }.is_err() {
+            // The failed retirement left the value untouched, so we still own
+            // it, and can free it directly.
+            //
+            // Safety: The retirement failed, so the value was never retired.
+            drop(unsafe { Box::from_raw(value) });
+            pressure.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[test]
+fn flaky_allocator_stress() {
+    let alloc = FlakyAlloc::new(50);
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(8);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let pressure = Pressure::default();
+
+    // Simulate memory pressure only once the collector has been created.
+    alloc.set_failing(true);
+
+    thread::scope(|s| {
+        // Half of the threads use local guards.
+        for _ in 0..cfg::THREADS / 2 {
+            s.spawn(|| {
+                retire_under_pressure(cfg::ITEMS, &dropped, &pressure, || collector.enter());
+            });
+        }
+
+        // The other half use owned guards, which allocate independently of the
+        // current thread.
+        for _ in 0..cfg::THREADS / 2 {
+            s.spawn(|| {
+                retire_under_pressure(cfg::ITEMS, &dropped, &pressure, || collector.enter_owned());
+            });
+        }
+    });
+
+    // Memory pressure was actually simulated.
+    assert!(alloc.failures() > 0);
+    assert!(pressure.rejected.load(Ordering::Relaxed) > 0);
+
+    // Dropping the collector reclaims everything that was retired. Note that
+    // reclamation never allocates, so it succeeds despite the pressure.
+    drop(collector);
+
+    // Every value was either reclaimed or freed after a failed retirement, and
+    // none of them were reclaimed twice.
+    assert_eq!(
+        dropped.load(Ordering::Relaxed),
+        pressure.created.load(Ordering::Relaxed)
+    );
+
+    // The collector freed everything it allocated, despite the failures.
+    assert_eq!(alloc.live(), 0);
+}
+
+#[test]
+fn budget_allocator_stress() {
+    let alloc = BudgetAlloc::new(usize::MAX);
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(8);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let pressure = Pressure::default();
+
+    // Allow the collector very little memory beyond what it has already
+    // allocated, so threads contend for the remaining budget.
+    alloc.set_budget(alloc.live() + 512);
+
+    thread::scope(|s| {
+        for _ in 0..cfg::THREADS {
+            s.spawn(|| {
+                retire_under_pressure(cfg::ITEMS, &dropped, &pressure, || collector.enter());
+            });
+        }
+    });
+
+    // The budget was actually exhausted.
+    assert!(pressure.rejected.load(Ordering::Relaxed) > 0);
+
+    // Everything is reclaimed once the collector is dropped.
+    drop(collector);
+
+    assert_eq!(
+        dropped.load(Ordering::Relaxed),
+        pressure.created.load(Ordering::Relaxed)
+    );
+    assert_eq!(alloc.live(), 0);
+}
+
+#[test]
+fn budget_exhaustion() {
+    // A collector cannot be created without enough memory for its thread-local
+    // storage.
+    assert!(Collector::new_in(BudgetAlloc::new(0)).is_err());
+
+    let alloc = BudgetAlloc::new(usize::MAX);
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(4);
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    let guard = collector.enter().unwrap();
+
+    // Cap the budget at what the collector has already allocated, exhausting it.
+    alloc.set_budget(alloc.live());
+
+    // Retiring reports the failure instead of aborting.
+    let value = boxed(DropTrack(dropped.clone()));
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    assert!(unsafe { guard.defer_retire(value, reclaim::boxed) }.is_err());
+    assert!(guard.reserve_retire().is_err());
+
+    // The failed retirement left the value untouched, so we still own it.
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+    // Safety: The retirement failed, so the value was never retired.
+    drop(unsafe { Box::from_raw(value) });
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+    // Nor does the collector abort on a thread it has never seen before, which
+    // has neither thread-local storage nor a retirement batch.
+    thread::scope(|s| {
+        s.spawn(|| {
+            let Ok(guard) = collector.enter() else {
+                return;
+            };
+
+            let value = boxed(DropTrack(dropped.clone()));
+
+            // Safety: The value was never shared, and was allocated with `Box`.
+            assert!(unsafe { guard.defer_retire(value, reclaim::boxed) }.is_err());
+
+            // Safety: The retirement failed, so the value was never retired.
+            drop(unsafe { Box::from_raw(value) });
+        });
+    });
+
+    assert_eq!(dropped.load(Ordering::Relaxed), 2);
+
+    // Retirement succeeds again once memory is available.
+    alloc.set_budget(usize::MAX);
+    let value = boxed(DropTrack(dropped.clone()));
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    unsafe { guard.defer_retire(value, reclaim::boxed) }.unwrap();
+
+    drop(guard);
+    drop(collector);
+
+    assert_eq!(dropped.load(Ordering::Relaxed), 3);
+    assert_eq!(alloc.live(), 0);
+}
+
+/// A stack that never aborts, and never leaks, under memory pressure.
+///
+/// Note that only the collector allocates through the flaky allocator; nodes
+/// are allocated with `Box` to keep the test focused on the collector.
+struct PressureStack {
+    head: AtomicPtr<Node<DropTrack>>,
+    collector: Collector,
+
+    /// Nodes that could not be retired, freed once the stack is quiesced.
+    stashed: Mutex<Vec<UnsafeSend<*mut Node<DropTrack>>>>,
+}
+
+impl PressureStack {
+    fn new(alloc: FlakyAlloc, batch_size: usize) -> PressureStack {
+        PressureStack {
+            head: AtomicPtr::new(ptr::null_mut()),
+            collector: Collector::new_in(alloc).unwrap().batch_size(batch_size),
+            stashed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Push a value onto the stack.
+    ///
+    /// Note that pushing never allocates through the collector.
+    fn push(&self, value: DropTrack, guard: &impl Guard) {
+        let new = boxed(Node {
+            data: ManuallyDrop::new(value),
+            next: ptr::null_mut(),
+        });
+
+        loop {
+            let head = guard.protect(&self.head, Ordering::Relaxed);
+            unsafe { (*new).next = head }
+
+            if self
+                .head
+                .compare_exchange(head, new, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Pop a value off of the stack.
+    fn pop(&self, guard: &impl Guard) -> Option<DropTrack> {
+        loop {
+            let head = guard.protect(&self.head, Ordering::Acquire);
+
+            if head.is_null() {
+                return None;
+            }
+
+            let next = unsafe { (*head).next };
+
+            // Reserve the retirement before unlinking the node. Once the node is
+            // unlinked it is unreachable to new readers and *must* be retired,
+            // a position from which an allocation failure could not be handled.
+            let reserved = guard.reserve_retire().is_ok();
+
+            if self
+                .head
+                .compare_exchange(head, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Safety: We unlinked the node, so we have unique ownership of
+                // its data.
+                let data = unsafe { ptr::read(&(*head).data) };
+
+                // Safety: The node is unreachable to new readers, and was
+                // allocated with `Box`.
+                let retired = unsafe { guard.defer_retire(head, reclaim::boxed) };
+
+                if retired.is_err() {
+                    // The reservation should have made this infallible.
+                    assert!(!reserved);
+
+                    // The node cannot be freed here, as concurrent readers may
+                    // still hold a reference to it, so it is stashed and freed
+                    // once every thread has finished.
+                    self.stashed.lock().unwrap().push(UnsafeSend(head));
+                }
+
+                return Some(ManuallyDrop::into_inner(data));
+            }
+        }
+    }
+
+    /// Free the nodes that could not be retired, returning their number.
+    ///
+    /// # Safety
+    ///
+    /// No thread may be accessing the stack, and all guards must have been
+    /// dropped.
+    unsafe fn free_stashed(&self) -> usize {
+        let mut stashed = self.stashed.lock().unwrap();
+        let count = stashed.len();
+
+        for node in stashed.drain(..) {
+            // Safety: The caller guarantees that no thread can be accessing the
+            // node, and it was allocated with `Box`.
+            drop(unsafe { Box::from_raw(node.0) });
+        }
+
+        count
+    }
+}
+
+#[test]
+fn pressure_stack_stress() {
+    let alloc = FlakyAlloc::new(25);
+    let stack = PressureStack::new(alloc.clone(), 4);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let pushed = AtomicUsize::new(0);
+
+    // Simulate memory pressure only once the stack has been created.
+    alloc.set_failing(true);
+
+    thread::scope(|s| {
+        for _ in 0..cfg::THREADS {
+            s.spawn(|| {
+                for _ in 0..cfg::ITEMS {
+                    // Entering can fail under pressure, in which case there is
+                    // nothing to do but try again later.
+                    let Ok(guard) = stack.collector.enter() else {
+                        continue;
+                    };
+
+                    stack.push(DropTrack(dropped.clone()), &guard);
+                    pushed.fetch_add(1, Ordering::Relaxed);
+                    stack.pop(&guard);
+                }
+            });
+        }
+    });
+
+    // Memory pressure was actually simulated.
+    assert!(alloc.failures() > 0);
+
+    // Drain whatever is left on the stack once the pressure subsides.
+    alloc.set_failing(false);
+    let guard = stack.collector.enter().unwrap();
+    while stack.pop(&guard).is_some() {}
+    drop(guard);
+
+    assert!(stack.head.load(Ordering::Relaxed).is_null());
+
+    // Every value that was pushed was popped, and dropped exactly once.
+    assert_eq!(dropped.load(Ordering::Relaxed), pushed.load(Ordering::Relaxed));
+
+    // Safety: All threads have finished and all guards have been dropped, so
+    // the stashed nodes are unreachable.
+    unsafe { stack.free_stashed() };
+
+    drop(stack.collector);
+    assert_eq!(alloc.live(), 0);
 }
 
 #[derive(Debug)]
