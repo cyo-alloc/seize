@@ -1,0 +1,5 @@
+# Leak sanitizer suppressions.
+#
+# No leaks are currently suppressed. This file exists because the safety
+# workflow points `LSAN_OPTIONS=suppressions` at it, and the sanitizer aborts
+# with an unhelpful error when it cannot read the file while reporting a leak.
