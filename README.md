@@ -48,9 +48,23 @@ memory efficiency is similar to that of hazard pointers. `seize` is compatible
 with all modern hardware that supports single-word atomic operations such as FAA
 and CAS.
 
+## Allocation
+
+`seize` never aborts on allocation failure. Its internal allocations go through
+the [`Allocator`] trait, defaulting to the global allocator, and every operation
+that may allocate returns a `Result`, leaving the collector unchanged on
+failure. A custom allocator can be provided with `Collector::new_in`.
+
+Two caveats. If a thread exits while allocation is failing, its thread ID may
+not be recycled, leaving thread-local storage sparser than it would otherwise
+be; this resolves as soon as memory is available again. And `seize` still
+panics on thread-ID exhaustion (after `2^64` thread creations) and on lock
+poisoning.
+
 [quick-start guide]: https://docs.rs/seize/latest/seize/guide/index.html
 [hazard pointers]:
   https://www.cs.otago.ac.nz/cosc440/readings/hazard-pointers.pdf
+[`Allocator`]: https://docs.rs/seize/latest/seize/alloc/trait.Allocator.html
 [hyaline reclamation scheme]: https://arxiv.org/pdf/1905.07903.pdf
 [epoch based reclamation]:
   https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf

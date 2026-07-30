@@ -89,7 +89,7 @@ mod seize_stack {
         fn new() -> TreiberStack<T> {
             TreiberStack {
                 head: AtomicPtr::new(ptr::null_mut()),
-                collector: Collector::new().batch_size(32),
+                collector: Collector::new().unwrap().batch_size(32),
             }
         }
 
@@ -99,7 +99,7 @@ mod seize_stack {
                 next: ptr::null_mut(),
             }));
 
-            let guard = self.collector.enter();
+            let guard = self.collector.enter().unwrap();
 
             loop {
                 let head = guard.protect(&self.head, Ordering::Relaxed);
@@ -116,7 +116,7 @@ mod seize_stack {
         }
 
         fn pop(&self) -> Option<T> {
-            let guard = self.collector.enter();
+            let guard = self.collector.enter().unwrap();
 
             loop {
                 let head = NonNull::new(guard.protect(&self.head, Ordering::Acquire))?.as_ptr();
@@ -130,7 +130,7 @@ mod seize_stack {
                 {
                     unsafe {
                         let data = ptr::read(&(*head).data);
-                        guard.defer_retire(head, reclaim::boxed);
+                        guard.defer_retire(head, reclaim::boxed).unwrap();
                         return Some(ManuallyDrop::into_inner(data));
                     }
                 }

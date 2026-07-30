@@ -6,6 +6,7 @@ mod collector;
 mod guard;
 mod raw;
 
+pub mod alloc;
 pub mod guide;
 pub mod reclaim;
 

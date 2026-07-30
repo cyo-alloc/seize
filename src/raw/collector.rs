@@ -1,6 +1,7 @@
 use super::membarrier;
 use super::tls::{Thread, ThreadLocal};
 use super::utils::CachePadded;
+use crate::alloc::{AllocError, Box, DynAlloc, Vec};
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr;
@@ -27,6 +28,10 @@ pub struct Collector {
     /// exiting.
     reservations: ThreadLocal<CachePadded<Reservation>>,
 
+    /// The allocator that all memory allocated by this collector, other than
+    /// retired objects, is allocated in.
+    alloc: DynAlloc,
+
     /// A unique identifier for a collector.
     pub(crate) id: usize,
 
@@ -37,17 +42,24 @@ pub struct Collector {
 
 impl Collector {
     /// Create a collector with the provided batch size and initial thread
-    /// count.
-    pub fn new(threads: usize, batch_size: usize) -> Self {
+    /// count, allocating in the given allocator.
+    pub fn new(threads: usize, batch_size: usize, alloc: DynAlloc) -> Result<Self, AllocError> {
         // A counter for collector IDs.
         static ID: AtomicUsize = AtomicUsize::new(0);
 
-        Self {
+        Ok(Self {
             id: ID.fetch_add(1, Ordering::Relaxed),
-            reservations: ThreadLocal::with_capacity(threads),
-            batches: ThreadLocal::with_capacity(threads),
+            reservations: ThreadLocal::with_capacity_in(threads, alloc.clone())?,
+            batches: ThreadLocal::with_capacity_in(threads, alloc.clone())?,
             batch_size: batch_size.next_power_of_two(),
-        }
+            alloc,
+        })
+    }
+
+    /// Returns a reference to the allocator used by this collector.
+    #[inline]
+    pub fn allocator(&self) -> &DynAlloc {
+        &self.alloc
     }
 
     /// Return the reservation for the given thread.
@@ -57,9 +69,9 @@ impl Collector {
     /// The current thread must have unique access to the reservation for the
     /// provided `thread`.
     #[inline]
-    pub unsafe fn reservation(&self, thread: Thread) -> &Reservation {
+    pub unsafe fn reservation(&self, thread: Thread) -> Result<&Reservation, AllocError> {
         // Safety: Guaranteed by caller.
-        unsafe { self.reservations.load(thread) }
+        unsafe { self.reservations.load(thread) }.map(|reservation| &**reservation)
     }
 
     /// Mark the current thread as active.
@@ -159,18 +171,23 @@ impl Collector {
     ///
     /// Additionally, current thread must have unique access to the batch for
     /// the provided `thread`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch could not be allocated, in which case the
+    /// pointer is not retired and remains owned by the caller.
     #[inline]
     pub unsafe fn add<T>(
         &self,
         ptr: *mut T,
         reclaim: unsafe fn(*mut T, &crate::Collector),
         thread: Thread,
-    ) {
+    ) -> Result<(), AllocError> {
         // Safety: The caller guarantees we have unique access to the batch.
-        let local_batch = unsafe { self.batches.load(thread).get() };
+        let local_batch = unsafe { self.batches.load(thread)?.get() };
 
         // Safety: The caller guarantees we have unique access to the batch.
-        let batch = unsafe { (*local_batch).get_or_init(self.batch_size) };
+        let batch = unsafe { (*local_batch).get_or_init(self.batch_size, &self.alloc)? };
 
         // If we are in a recursive call during `drop` or `reclaim_all`, reclaim the
         // object immediately.
@@ -179,8 +196,14 @@ impl Collector {
             // Additionally, the caller guarantees that the pointer is valid for the
             // provided reclaimer.
             unsafe { reclaim(ptr, crate::Collector::from_raw(self)) }
-            return;
+            return Ok(());
         }
+
+        // Reserve space for the entry before modifying the batch, ensuring that we
+        // leave the batch untouched if we run out of memory.
+        //
+        // Safety: The caller guarantees we have unique access to the batch.
+        unsafe { (*batch).entries.try_reserve(1).map_err(|_| AllocError)? };
 
         // Safety: `fn(*mut T) and fn(*mut U)` are ABI compatible if `T, U: Sized`.
         let reclaim: unsafe fn(*mut (), &crate::Collector) =
@@ -188,7 +211,8 @@ impl Collector {
 
         // Safety: The caller guarantees we have unique access to the batch.
         let len = unsafe {
-            // Create an entry for this node.
+            // Create an entry for this node. Note that we reserved space above, so this
+            // cannot allocate.
             (*batch).entries.push(Entry {
                 batch,
                 reclaim,
@@ -207,6 +231,35 @@ impl Collector {
             // are not holding on to any mutable references.
             unsafe { self.try_retire(local_batch) }
         }
+
+        Ok(())
+    }
+
+    /// Reserve space for a single deferred retirement, so that the next call to
+    /// `add` for this `thread` does not allocate.
+    ///
+    /// # Safety
+    ///
+    /// The current thread must have unique access to the batch for the provided
+    /// `thread`.
+    #[inline]
+    pub unsafe fn reserve(&self, thread: Thread) -> Result<(), AllocError> {
+        // Safety: The caller guarantees we have unique access to the batch.
+        let local_batch = unsafe { self.batches.load(thread)?.get() };
+
+        // Safety: The caller guarantees we have unique access to the batch.
+        let batch = unsafe { (*local_batch).get_or_init(self.batch_size, &self.alloc)? };
+
+        // If we are in a recursive call during `drop` or `reclaim_all`, retirement
+        // reclaims immediately without allocating, so there is nothing to reserve.
+        if batch == LocalBatch::DROP {
+            return Ok(());
+        }
+
+        // Safety: The caller guarantees we have unique access to the batch.
+        unsafe { (*batch).entries.try_reserve(1).map_err(|_| AllocError)? };
+
+        Ok(())
     }
 
     /// Attempt to retire objects in the current thread's batch.
@@ -217,8 +270,16 @@ impl Collector {
     /// `thread`.
     #[inline]
     pub unsafe fn try_retire_batch(&self, thread: Thread) {
+        // If the thread has no local batch, there is nothing to retire. Note that
+        // looking up the batch this way never allocates, so flushing is infallible.
+        //
         // Safety: Guaranteed by caller.
-        unsafe { self.try_retire(self.batches.load(thread).get()) }
+        let Some(local_batch) = (unsafe { self.batches.get(thread) }) else {
+            return;
+        };
+
+        // Safety: Guaranteed by caller.
+        unsafe { self.try_retire(local_batch.get()) }
     }
 
     /// Attempt to retire objects in this batch.
@@ -468,7 +529,7 @@ impl Collector {
             unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
         }
 
-        unsafe { LocalBatch::free(batch) };
+        unsafe { LocalBatch::free(batch, &self.alloc) };
     }
 }
 
@@ -523,13 +584,17 @@ struct Batch {
 }
 
 impl Batch {
-    /// Create a new batch with the specified capacity.
+    /// Create a new batch with the specified capacity, allocating in the given
+    /// allocator.
     #[inline]
-    fn new(capacity: usize) -> Batch {
-        Batch {
-            entries: Vec::with_capacity(capacity),
+    fn new(capacity: usize, alloc: DynAlloc) -> Result<Batch, AllocError> {
+        let mut entries = Vec::new_in(alloc);
+        entries.try_reserve_exact(capacity).map_err(|_| AllocError)?;
+
+        Ok(Batch {
+            entries,
             active: AtomicUsize::new(0),
-        }
+        })
     }
 }
 
@@ -584,25 +649,28 @@ impl LocalBatch {
     /// to retire to reclaim immediately.
     const DROP: *mut Batch = usize::MAX as _;
 
-    /// Returns a pointer to the batch, initializing the batch if it was null.
+    /// Returns a pointer to the batch, initializing the batch in the given
+    /// allocator if it was null.
     #[inline]
-    fn get_or_init(&mut self, capacity: usize) -> *mut Batch {
+    fn get_or_init(&mut self, capacity: usize, alloc: &DynAlloc) -> Result<*mut Batch, AllocError> {
         if self.batch.is_null() {
-            self.batch = Box::into_raw(Box::new(Batch::new(capacity)));
+            let batch = Batch::new(capacity, alloc.clone())?;
+            self.batch = Box::into_raw(Box::try_new_in(batch, alloc.clone())?);
         }
 
-        self.batch
+        Ok(self.batch)
     }
 
     /// Free the batch.
     ///
     /// # Safety
     ///
-    /// The safety requirements of `Box::from_raw` apply.
+    /// The safety requirements of `Box::from_raw_in` apply, and the batch must
+    /// have been allocated in `alloc`.
     #[inline]
-    unsafe fn free(batch: *mut Batch) {
+    unsafe fn free(batch: *mut Batch, alloc: &DynAlloc) {
         // Safety: Guaranteed by caller.
-        unsafe { drop(Box::from_raw(batch)) }
+        unsafe { drop(Box::from_raw_in(batch, alloc.clone())) }
     }
 }
 

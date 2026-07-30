@@ -2,6 +2,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::alloc::AllocError;
 use crate::raw::{self, Reservation, Thread};
 use crate::Collector;
 
@@ -118,11 +119,49 @@ pub trait Guard {
         )
     }
 
+    /// Reserves space for a single deferred retirement.
+    ///
+    /// After this method returns `Ok`, the next call to [`defer_retire`] on this
+    /// guard is guaranteed not to allocate, and so cannot fail. This is useful
+    /// for retiring an object from a position where an error cannot be handled,
+    /// such as after a value has been made unreachable to other threads.
+    ///
+    /// The reservation is not tracked, so it does not need to be released; an
+    /// unused reservation simply leaves the collector with spare capacity.
+    ///
+    /// # Guarantees
+    ///
+    /// The guarantee holds as long as none of the following happen on the
+    /// current thread between the reservation and the retirement:
+    ///
+    /// - another call to [`defer_retire`] or [`Collector::retire`]
+    /// - a call to [`flush`](Guard::flush) or [`refresh`](Guard::refresh)
+    /// - a call to [`Collector::reclaim_all`]
+    ///
+    /// Note that the reservation applies to *this* guard. Reserving through an
+    /// [`OwnedGuard`] and retiring through [`Collector::retire`] targets a
+    /// different retirement batch, so the reservation does not apply.
+    ///
+    /// Violating any of the above is not unsound. The retirement may simply
+    /// allocate, and thus fail, as it would have without a reservation.
+    ///
+    /// [`defer_retire`]: Guard::defer_retire
+    /// [`Collector::reclaim_all`]: crate::Collector::reclaim_all
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retirement batch could not be allocated.
+    fn reserve_retire(&self) -> Result<(), AllocError>;
+
     /// Retires a value, running `reclaim` when no threads hold a reference to
     /// it.
     ///
     /// This method delays reclamation until the guard is dropped, as opposed to
     /// [`Collector::retire`], which may reclaim objects immediately.
+    ///
+    /// Note that this method may allocate. See
+    /// [`reserve_retire`](Guard::reserve_retire) for retiring from a position
+    /// where an error cannot be handled.
     ///
     ///
     /// # Safety
@@ -130,7 +169,16 @@ pub trait Guard {
     /// The retired pointer must no longer be accessible to any thread that
     /// enters after it is removed. Additionally, the pointer must be valid
     /// to pass to the provided reclaimer, once it is safe to reclaim.
-    unsafe fn defer_retire<T>(&self, ptr: *mut T, reclaim: unsafe fn(*mut T, &Collector));
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retirement batch could not be allocated, in
+    /// which case the pointer is not retired and remains owned by the caller.
+    unsafe fn defer_retire<T>(
+        &self,
+        ptr: *mut T,
+        reclaim: unsafe fn(*mut T, &Collector),
+    ) -> Result<(), AllocError>;
 }
 
 /// A guard that keeps the current thread marked as active.
@@ -159,11 +207,11 @@ pub struct LocalGuard<'a> {
 
 impl LocalGuard<'_> {
     #[inline]
-    pub(crate) fn enter(collector: &Collector) -> LocalGuard<'_> {
+    pub(crate) fn enter(collector: &Collector) -> Result<LocalGuard<'_>, AllocError> {
         let thread = Thread::current();
 
         // Safety: `thread` is the current thread.
-        let reservation = unsafe { collector.raw.reservation(thread) };
+        let reservation = unsafe { collector.raw.reservation(thread)? };
 
         // Calls to `enter` may be reentrant, so we need to keep track of the number of
         // active guards for the current thread.
@@ -175,12 +223,12 @@ impl LocalGuard<'_> {
             unsafe { collector.raw.enter(reservation) };
         }
 
-        LocalGuard {
+        Ok(LocalGuard {
             thread,
             reservation,
             collector,
             _unsend: PhantomData,
-        }
+        })
     }
 }
 
@@ -220,10 +268,21 @@ impl Guard for LocalGuard<'_> {
         self.thread.id
     }
 
+    /// Reserves space for a single deferred retirement.
+    #[inline]
+    fn reserve_retire(&self) -> Result<(), AllocError> {
+        // Safety: `self.thread` is the current thread.
+        unsafe { self.collector.raw.reserve(self.thread) }
+    }
+
     /// Retires a value, running `reclaim` when no threads hold a reference to
     /// it.
     #[inline]
-    unsafe fn defer_retire<T>(&self, ptr: *mut T, reclaim: unsafe fn(*mut T, &Collector)) {
+    unsafe fn defer_retire<T>(
+        &self,
+        ptr: *mut T,
+        reclaim: unsafe fn(*mut T, &Collector),
+    ) -> Result<(), AllocError> {
         // Safety:
         // - `self.thread` is the current thread.
         // - The validity of the pointer is guaranteed by the caller.
@@ -287,21 +346,30 @@ unsafe impl Send for OwnedGuard<'_> {}
 
 impl OwnedGuard<'_> {
     #[inline]
-    pub(crate) fn enter(collector: &Collector) -> OwnedGuard<'_> {
+    pub(crate) fn enter(collector: &Collector) -> Result<OwnedGuard<'_>, AllocError> {
         // Create a thread slot that will last for the lifetime of this guard.
         let thread = Thread::create();
 
         // Safety: We have ownership of `thread` and have not shared it.
-        let reservation = unsafe { collector.raw.reservation(thread) };
+        let reservation = match unsafe { collector.raw.reservation(thread) } {
+            Ok(reservation) => reservation,
+
+            // Release the thread slot if we failed to allocate its reservation.
+            Err(err) => {
+                // Safety: We own `thread` and never shared it.
+                unsafe { Thread::free(thread.id) };
+                return Err(err);
+            }
+        };
 
         // Safety: We have ownership of `reservation`.
         unsafe { collector.raw.enter(reservation) };
 
-        OwnedGuard {
+        Ok(OwnedGuard {
             collector,
             thread,
             reservation,
-        }
+        })
     }
 }
 
@@ -343,10 +411,25 @@ impl Guard for OwnedGuard<'_> {
         Thread::current().id
     }
 
+    /// Reserves space for a single deferred retirement.
+    #[inline]
+    fn reserve_retire(&self) -> Result<(), AllocError> {
+        // Safety: `self.reservation` is owned by the current thread.
+        let reservation = unsafe { &*self.reservation };
+        let _lock = reservation.lock.lock().unwrap();
+
+        // Safety: We hold the lock and so have unique access to the batch.
+        unsafe { self.collector.raw.reserve(self.thread) }
+    }
+
     /// Retires a value, running `reclaim` when no threads hold a reference to
     /// it.
     #[inline]
-    unsafe fn defer_retire<T>(&self, ptr: *mut T, reclaim: unsafe fn(*mut T, &Collector)) {
+    unsafe fn defer_retire<T>(
+        &self,
+        ptr: *mut T,
+        reclaim: unsafe fn(*mut T, &Collector),
+    ) -> Result<(), AllocError> {
         // Safety: `self.reservation` is owned by the current thread.
         let reservation = unsafe { &*self.reservation };
         let _lock = reservation.lock.lock().unwrap();

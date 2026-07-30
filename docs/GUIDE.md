@@ -51,7 +51,7 @@ impl Stack {
             value: ManuallyDrop::new(value),
         }));
 
-        let guard = self.collector.enter(); // <===
+        let guard = self.collector.enter().unwrap(); // <===
 
         // ...
     }
@@ -112,7 +112,7 @@ reference to it any longer.
 impl<T> Stack<T> {
     pub fn pop(&self) -> Option<T> {
         // Mark the thread as active.
-        let guard = self.collector.enter();
+        let guard = self.collector.enter().unwrap();
 
         loop {
             // Perform a protected load of the head.
@@ -135,7 +135,7 @@ impl<T> Stack<T> {
                     let data = ptr::read(&(*head).value);
 
                     // Retire the previous head now that it has been popped.
-                    self.collector.retire(head, reclaim::boxed); // <===
+                    self.collector.retire(head, reclaim::boxed).unwrap(); // <===
 
                     // Return the value.
                     return Some(ManuallyDrop::into_inner(data));
@@ -167,7 +167,7 @@ makes the following code unsound.
 
 ```rust,ignore
 let ptr = guard.protect(&node, Ordering::Acquire);
-collector.retire(ptr, reclaim::boxed);
+collector.retire(ptr, reclaim::boxed).unwrap();
 
 // **Unsound**, the pointer has been retired.
 println!("{}", (*ptr).value);
@@ -178,7 +178,7 @@ on the guard, instead of on the collector directly.
 
 ```rust,ignore
 let ptr = guard.protect(&node, Ordering::Acquire);
-guard.defer_retire(ptr, reclaim::boxed);
+guard.defer_retire(ptr, reclaim::boxed).unwrap();
 
 // This read is fine.
 println!("{}", (*ptr).value);
@@ -200,7 +200,7 @@ use seize::reclaim;
 impl<T> Stack<T> {
     pub fn pop(&self) -> Option<T> {
         // ...
-        self.collector.retire(head, reclaim::boxed);
+        self.collector.retire(head, reclaim::boxed).unwrap();
         // ...
     }
 }
@@ -209,21 +209,57 @@ impl<T> Stack<T> {
 If you need to run custom reclamation code, you can write a custom reclaimer.
 
 ```rust,ignore
-collector.retire(value, |value: *mut Node<T>, _collector: &Collector| unsafe {
-    // Safety: The value was allocated with `Box::new`.
-    let value = Box::from_raw(ptr);
-    println!("Dropping {value}");
-    drop(value);
-});
+collector
+    .retire(value, |value: *mut Node<T>, _collector: &Collector| unsafe {
+        // Safety: The value was allocated with `Box::new`.
+        let value = Box::from_raw(ptr);
+        println!("Dropping {value}");
+        drop(value);
+    })
+    .unwrap();
 ```
 
 Note that the reclaimer receives a reference to the collector as its second
 argument, allowing for recursive reclamation.
 
+# Allocation Failure
+
+`seize` never aborts on allocation failure. Any operation that may allocate —
+creating a collector, entering it, or retiring an object — returns a `Result`,
+and leaves the collector unchanged if allocation fails. The examples above use
+`unwrap` for brevity, but a data structure can propagate the error instead.
+
+Note that a failed `retire` does not take ownership of the pointer, so the
+caller is free to retry, or to free the object itself once it is safe to do so.
+
+If you need to retire an object from a position where an error cannot be
+handled — typically after a compare-and-swap has already made the object
+unreachable — reserve the retirement beforehand with [`reserve_retire`], while
+you can still fail cleanly. The following retirement is then guaranteed not to
+allocate.
+
+```rust,ignore
+// Reserve before committing, while an error can still be returned.
+guard.reserve_retire()?;
+
+if self.head.compare_exchange(head, next, Ordering::Release, Ordering::Relaxed).is_ok() {
+    // The node is now unreachable, and this retirement cannot fail.
+    unsafe { guard.defer_retire(head, reclaim::boxed).unwrap() };
+}
+```
+
+A custom allocator can be provided with [`Collector::new_in`], which is useful
+for allocating a data structure's internal metadata in an arena or a
+memory-tracking allocator.
+
 [`defer_retire`]:
   https://docs.rs/seize/latest/seize/trait.Guard.html#tymethod.defer_retire
+[`reserve_retire`]:
+  https://docs.rs/seize/latest/seize/trait.Guard.html#tymethod.reserve_retire
 [`Guard::protect`]:
   https://docs.rs/seize/latest/seize/trait.Guard.html#tymethod.protect
 [`seize::reclaim`]: https://docs.rs/seize/latest/seize/reclaim/index.html
+[`Collector::new_in`]:
+  https://docs.rs/seize/latest/seize/struct.Collector.html#method.new_in
 [`reclaim::boxed`]: https://docs.rs/seize/latest/seize/reclaim/fn.boxed.html
 [ABA problem]: https://en.wikipedia.org/wiki/ABA_problem

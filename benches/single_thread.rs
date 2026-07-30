@@ -5,9 +5,9 @@ use criterion::{criterion_group, criterion_main, Criterion};
 fn enter_leave(c: &mut Criterion) {
     let mut group = c.benchmark_group("enter_leave");
     group.bench_function("seize", |b| {
-        let collector = seize::Collector::new();
+        let collector = seize::Collector::new().unwrap();
         b.iter(|| {
-            black_box(collector.enter());
+            black_box(collector.enter().unwrap());
         });
     });
 

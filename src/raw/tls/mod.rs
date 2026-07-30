@@ -7,8 +7,11 @@
 
 mod thread_id;
 
+use crate::alloc::{self, AllocError, DynAlloc, Layout};
+
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, Ordering};
 use std::{mem, ptr};
 
@@ -18,6 +21,9 @@ pub use thread_id::Thread;
 pub struct ThreadLocal<T> {
     /// Buckets with increasing power-of-two sizes.
     buckets: [AtomicPtr<Entry<T>>; thread_id::BUCKETS],
+
+    /// The allocator that buckets are allocated in.
+    alloc: DynAlloc,
 }
 
 /// An entry in a `ThreadLocal`.
@@ -35,6 +41,7 @@ struct Entry<T> {
 ///   hence `T: Send`.
 /// - However, it is impossible to obtain shared references to `T`s except by
 ///   sharing the `ThreadLocal`, so `T: Sync` is not required.
+/// - The allocator is `Send + Sync`.
 unsafe impl<T: Send> Send for ThreadLocal<T> {}
 
 /// Safety:
@@ -43,11 +50,14 @@ unsafe impl<T: Send> Send for ThreadLocal<T> {}
 ///   another thread than they were created on, hence `T: Send`.
 /// - However, there is no way to access a `T` inserted by another thread except
 ///   through iteration, which is unsafe, so `T: Sync` is not required.
+/// - The allocator is `Send + Sync`, and is only accessed through a shared
+///   reference.
 unsafe impl<T: Send> Sync for ThreadLocal<T> {}
 
 impl<T> ThreadLocal<T> {
-    /// Create a `ThreadLocal` container with the given initial capacity.
-    pub fn with_capacity(capacity: usize) -> ThreadLocal<T> {
+    /// Create a `ThreadLocal` container with the given initial capacity,
+    /// allocating in the given allocator.
+    pub fn with_capacity_in(capacity: usize, alloc: DynAlloc) -> Result<ThreadLocal<T>, AllocError> {
         let init = match capacity {
             0 => 0,
             // Initialize enough buckets for `capacity` elements.
@@ -56,16 +66,35 @@ impl<T> ThreadLocal<T> {
 
         let mut buckets = [ptr::null_mut(); thread_id::BUCKETS];
 
-        // Initialize the initial buckets.
-        for (i, bucket) in buckets[..=init].iter_mut().enumerate() {
-            let bucket_size = Thread::bucket_capacity(i);
-            *bucket = allocate_bucket::<T>(bucket_size);
+        // Initialize the initial buckets, freeing any that were already allocated if we
+        // run out of memory.
+        for i in 0..=init {
+            match allocate_bucket::<T>(&alloc, Thread::bucket_capacity(i)) {
+                Ok(bucket) => buckets[i] = bucket,
+                Err(err) => {
+                    for (j, bucket) in buckets[..i].iter().enumerate() {
+                        // Safety: We allocated this bucket above with the same capacity, and never
+                        // shared it, so none of its entries are initialized.
+                        unsafe { free_bucket::<T>(&alloc, *bucket, Thread::bucket_capacity(j)) };
+                    }
+
+                    return Err(err);
+                }
+            }
         }
 
-        ThreadLocal {
+        Ok(ThreadLocal {
             // Safety: `AtomicPtr<T>` has the same representation as `*mut T`.
             buckets: unsafe { mem::transmute(buckets) },
-        }
+            alloc,
+        })
+    }
+
+    /// Create a `ThreadLocal` container with the given initial capacity,
+    /// allocating in the global allocator.
+    #[cfg(test)]
+    pub fn with_capacity(capacity: usize) -> ThreadLocal<T> {
+        ThreadLocal::with_capacity_in(capacity, DynAlloc::Global).unwrap()
     }
 
     /// Load the slot for the given `thread`, initializing it with a default
@@ -76,7 +105,7 @@ impl<T> ThreadLocal<T> {
     /// The current thread must have unique access to the slot for the provided
     /// `thread`.
     #[inline]
-    pub unsafe fn load(&self, thread: Thread) -> &T
+    pub unsafe fn load(&self, thread: Thread) -> Result<&T, AllocError>
     where
         T: Default,
     {
@@ -92,13 +121,17 @@ impl<T> ThreadLocal<T> {
     /// The current thread must have unique access to the slot for the given
     /// `thread`.
     #[inline]
-    pub unsafe fn load_or(&self, create: impl Fn() -> T, thread: Thread) -> &T {
+    pub unsafe fn load_or(
+        &self,
+        create: impl Fn() -> T,
+        thread: Thread,
+    ) -> Result<&T, AllocError> {
         // Safety: `thread.bucket` is always in bounds.
         let bucket = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let mut bucket_ptr = bucket.load(Ordering::Acquire);
 
         if bucket_ptr.is_null() {
-            bucket_ptr = self.initialize(bucket, thread);
+            bucket_ptr = self.initialize(bucket, thread)?;
         }
 
         // Safety: `thread.entry` is always in bounds, and we ensured the bucket was
@@ -112,15 +145,20 @@ impl<T> ThreadLocal<T> {
         }
 
         // Safety: The entry was initialized above.
-        unsafe { (*entry.value.get()).assume_init_ref() }
+        Ok(unsafe { (*entry.value.get()).assume_init_ref() })
     }
 
-    /// Load the entry for the current thread, returning `None` if it has not
+    /// Load the entry for the given `thread`, returning `None` if it has not
     /// been initialized.
-    #[cfg(test)]
-    fn try_load(&self) -> Option<&T> {
-        let thread = Thread::current();
-
+    ///
+    /// Unlike [`load_or`](ThreadLocal::load_or), this method never allocates.
+    ///
+    /// # Safety
+    ///
+    /// The current thread must have unique access to the slot for the given
+    /// `thread`.
+    #[inline]
+    pub unsafe fn get(&self, thread: Thread) -> Option<&T> {
         // Safety: `thread.bucket` is always in bounds.
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
@@ -140,6 +178,14 @@ impl<T> ThreadLocal<T> {
 
         // Safety: The entry was initialized above.
         unsafe { Some((*entry.value.get()).assume_init_ref()) }
+    }
+
+    /// Load the entry for the current thread, returning `None` if it has not
+    /// been initialized.
+    #[cfg(test)]
+    fn try_load(&self) -> Option<&T> {
+        // Safety: Loading with `Thread::current` is always sound.
+        unsafe { self.get(Thread::current()) }
     }
 
     /// Initialize the entry for the given thread.
@@ -173,10 +219,15 @@ impl<T> ThreadLocal<T> {
     // Initialize the bucket for the given thread's entry.
     #[cold]
     #[inline(never)]
-    fn initialize(&self, bucket: &AtomicPtr<Entry<T>>, thread: Thread) -> *mut Entry<T> {
-        let new_bucket = allocate_bucket(Thread::bucket_capacity(thread.bucket));
+    fn initialize(
+        &self,
+        bucket: &AtomicPtr<Entry<T>>,
+        thread: Thread,
+    ) -> Result<*mut Entry<T>, AllocError> {
+        let capacity = Thread::bucket_capacity(thread.bucket);
+        let new_bucket = allocate_bucket::<T>(&self.alloc, capacity)?;
 
-        match bucket.compare_exchange(
+        Ok(match bucket.compare_exchange(
             ptr::null_mut(),
             new_bucket,
             // Release: If we win the race, synchronize with Acquire loads of the bucket from other
@@ -191,15 +242,13 @@ impl<T> ThreadLocal<T> {
 
             // We lost the race and can use the bucket that was stored instead.
             Err(other) => unsafe {
-                // Safety: The pointer has not been shared.
-                let _ = Box::from_raw(ptr::slice_from_raw_parts_mut(
-                    new_bucket,
-                    Thread::bucket_capacity(thread.bucket),
-                ));
+                // Safety: The pointer has not been shared, so none of its entries were
+                // initialized.
+                free_bucket::<T>(&self.alloc, new_bucket, capacity);
 
                 other
             },
-        }
+        })
     }
 
     /// Returns an iterator over all active thread slots.
@@ -221,7 +270,7 @@ impl<T> ThreadLocal<T> {
 
 impl<T> Drop for ThreadLocal<T> {
     fn drop(&mut self) {
-        // Drop any buckets that were allocatec.
+        // Drop any buckets that were allocated.
         for (i, bucket) in self.buckets.iter_mut().enumerate() {
             let bucket_ptr = *bucket.get_mut();
 
@@ -232,8 +281,7 @@ impl<T> Drop for ThreadLocal<T> {
             let bucket_size = Thread::bucket_capacity(i);
 
             // Safety: We have `&mut self` and ensured the bucket was initialized.
-            let _ =
-                unsafe { Box::from_raw(std::slice::from_raw_parts_mut(bucket_ptr, bucket_size)) };
+            unsafe { free_bucket::<T>(&self.alloc, bucket_ptr, bucket_size) };
         }
     }
 }
@@ -301,16 +349,55 @@ impl<'a, T> Iterator for Iter<'a, T> {
     }
 }
 
-/// Allocate a bucket with the given capacity.
-fn allocate_bucket<T>(capacity: usize) -> *mut Entry<T> {
-    let entries = (0..capacity)
-        .map(|_| Entry::<T> {
-            present: AtomicBool::new(false),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        })
-        .collect::<Box<[Entry<T>]>>();
+/// Returns the layout of a bucket with the given capacity.
+///
+/// Returns an error if the layout would overflow, which is treated the same as
+/// running out of memory.
+#[inline]
+fn bucket_layout<T>(capacity: usize) -> Result<Layout, AllocError> {
+    Layout::array::<Entry<T>>(capacity).map_err(|_| AllocError)
+}
 
-    Box::into_raw(entries) as *mut _
+/// Allocate a bucket with the given capacity in the given allocator.
+fn allocate_bucket<T>(alloc: &DynAlloc, capacity: usize) -> Result<*mut Entry<T>, AllocError> {
+    let bucket = alloc::allocate(alloc, bucket_layout::<T>(capacity)?)?
+        .as_ptr()
+        .cast::<Entry<T>>();
+
+    for i in 0..capacity {
+        // Safety: `i` is in-bounds of the allocation, which is valid for writes.
+        unsafe {
+            bucket.add(i).write(Entry {
+                present: AtomicBool::new(false),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+            })
+        };
+    }
+
+    Ok(bucket)
+}
+
+/// Free a bucket allocated by `allocate_bucket`, dropping any entries that were
+/// initialized.
+///
+/// # Safety
+///
+/// The bucket must have been allocated in `alloc` with the same `capacity`, and
+/// must not be accessed after this call.
+unsafe fn free_bucket<T>(alloc: &DynAlloc, bucket: *mut Entry<T>, capacity: usize) {
+    // Safety: Guaranteed by caller. Note that `Entry` takes care of dropping the
+    // value it holds, if any.
+    unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(bucket, capacity)) };
+
+    // Safety: Guaranteed by caller. Note that the layout cannot overflow, as the
+    // bucket was successfully allocated with it.
+    unsafe {
+        alloc::deallocate(
+            alloc,
+            NonNull::new_unchecked(bucket.cast::<u8>()),
+            bucket_layout::<T>(capacity).unwrap(),
+        )
+    };
 }
 
 #[cfg(test)]
@@ -335,11 +422,11 @@ mod tests {
             let create = make_create();
             let tls = ThreadLocal::with_capacity(1);
             assert_eq!(None, tls.try_load());
-            assert_eq!(0, *tls.load_or(|| create(), Thread::current()));
+            assert_eq!(0, *tls.load_or(|| create(), Thread::current()).unwrap());
             assert_eq!(Some(&0), tls.try_load());
-            assert_eq!(0, *tls.load_or(|| create(), Thread::current()));
+            assert_eq!(0, *tls.load_or(|| create(), Thread::current()).unwrap());
             assert_eq!(Some(&0), tls.try_load());
-            assert_eq!(0, *tls.load_or(|| create(), Thread::current()));
+            assert_eq!(0, *tls.load_or(|| create(), Thread::current()).unwrap());
             assert_eq!(Some(&0), tls.try_load());
         }
     }
@@ -351,21 +438,21 @@ mod tests {
             let create = make_create();
             let tls = Arc::new(ThreadLocal::with_capacity(1));
             assert_eq!(None, tls.try_load());
-            assert_eq!(0, *tls.load_or(|| create(), Thread::current()));
+            assert_eq!(0, *tls.load_or(|| create(), Thread::current()).unwrap());
             assert_eq!(Some(&0), tls.try_load());
 
             let tls2 = tls.clone();
             let create2 = create.clone();
             thread::spawn(move || {
                 assert_eq!(None, tls2.try_load());
-                assert_eq!(1, *tls2.load_or(|| create2(), Thread::current()));
+                assert_eq!(1, *tls2.load_or(|| create2(), Thread::current()).unwrap());
                 assert_eq!(Some(&1), tls2.try_load());
             })
             .join()
             .unwrap();
 
             assert_eq!(Some(&0), tls.try_load());
-            assert_eq!(0, *tls.load_or(|| create(), Thread::current()));
+            assert_eq!(0, *tls.load_or(|| create(), Thread::current()).unwrap());
         }
     }
 
@@ -374,14 +461,14 @@ mod tests {
         // Safety: Loading with `Thread::current` is always sound.
         unsafe {
             let tls = Arc::new(ThreadLocal::with_capacity(1));
-            tls.load_or(|| Box::new(1), Thread::current());
+            tls.load_or(|| Box::new(1), Thread::current()).unwrap();
 
             let tls2 = tls.clone();
             thread::spawn(move || {
-                tls2.load_or(|| Box::new(2), Thread::current());
+                tls2.load_or(|| Box::new(2), Thread::current()).unwrap();
                 let tls3 = tls2.clone();
                 thread::spawn(move || {
-                    tls3.load_or(|| Box::new(3), Thread::current());
+                    tls3.load_or(|| Box::new(3), Thread::current()).unwrap();
                 })
                 .join()
                 .unwrap();
@@ -403,10 +490,10 @@ mod tests {
         // Safety: Loading with `Thread::current` is always sound.
         unsafe {
             let tls = Arc::new(ThreadLocal::with_capacity(1));
-            tls.load_or(|| Box::new(1), Thread::current());
+            tls.load_or(|| Box::new(1), Thread::current()).unwrap();
 
             let iterator = tls.iter();
-            tls.load_or(|| Box::new(2), Thread::current());
+            tls.load_or(|| Box::new(2), Thread::current()).unwrap();
 
             let v = iterator.map(|x| **x).collect::<Vec<i32>>();
             assert_eq!(vec![1], v);
@@ -426,7 +513,7 @@ mod tests {
         let dropped = Arc::new(AtomicUsize::new(0));
         // Safety: Loading with `Thread::current` is always sound.
         unsafe {
-            local.load_or(|| Dropped(dropped.clone()), Thread::current());
+            local.load_or(|| Dropped(dropped.clone()), Thread::current()).unwrap();
         }
         assert_eq!(dropped.load(Relaxed), 0);
         drop(local);
@@ -445,7 +532,7 @@ mod tests {
                 dbg!(i);
                 // Safety: Loading with `Thread::current` is always sound.
                 unsafe {
-                    tls.load_or(|| 1, Thread::current());
+                    tls.load_or(|| 1, Thread::current()).unwrap();
                 }
                 barrier.wait();
             });

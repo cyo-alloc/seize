@@ -1,8 +1,10 @@
+use seize::alloc::{AllocError, Allocator, Global, Layout};
 use seize::{reclaim, Collector, Guard};
 
 use std::mem::ManuallyDrop;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 
@@ -11,6 +13,191 @@ fn is_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Collector>();
     assert_send_sync::<Collector>();
+}
+
+/// The allocation counters shared with a `CountingAlloc`.
+#[derive(Default)]
+struct Counters {
+    allocated: AtomicUsize,
+    live: AtomicUsize,
+}
+
+/// An allocator that counts the memory it has allocated and not yet freed.
+///
+/// Note that `Allocator` is implemented for the handle, not the counters, as
+/// `Collector::new_in` takes ownership of the allocator.
+#[derive(Clone, Default)]
+struct CountingAlloc(Arc<Counters>);
+
+// Safety: All allocations are forwarded to the global allocator.
+unsafe impl Allocator for CountingAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr = Global.allocate(layout)?;
+        self.0.allocated.fetch_add(layout.size(), Ordering::Relaxed);
+        self.0.live.fetch_add(layout.size(), Ordering::Relaxed);
+        Ok(ptr)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.0.live.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+#[test]
+fn custom_allocator() {
+    let alloc = CountingAlloc::default();
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(2);
+
+    // Creating a collector allocates thread-local storage.
+    assert!(alloc.0.allocated.load(Ordering::Relaxed) > 0);
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    {
+        let guard = collector.enter().unwrap();
+
+        // Retire enough values to allocate, and reclaim, a batch.
+        for _ in 0..10 {
+            let value = boxed(DropTrack(dropped.clone()));
+
+            // Safety: The value was never shared, and was allocated with `Box`.
+            unsafe { guard.defer_retire(value, reclaim::boxed).unwrap() };
+        }
+    }
+
+    let allocated = alloc.0.allocated.load(Ordering::Relaxed);
+    drop(collector);
+
+    // All retired values were reclaimed.
+    assert_eq!(dropped.load(Ordering::Relaxed), 10);
+
+    // Everything the collector allocated was freed through the same allocator,
+    // and nothing was allocated after it was dropped.
+    assert_eq!(alloc.0.live.load(Ordering::Relaxed), 0);
+    assert_eq!(alloc.0.allocated.load(Ordering::Relaxed), allocated);
+}
+
+/// An allocator that can be switched to fail every allocation.
+#[derive(Clone, Default)]
+struct FailingAlloc(Arc<AtomicBool>);
+
+impl FailingAlloc {
+    /// Set whether allocations should fail.
+    fn set_failing(&self, failing: bool) {
+        self.0.store(failing, Ordering::Relaxed);
+    }
+}
+
+// Safety: Allocations are either forwarded to the global allocator or fail.
+// Note that deallocation always succeeds.
+unsafe impl Allocator for FailingAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if self.0.load(Ordering::Relaxed) {
+            return Err(AllocError);
+        }
+
+        Global.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+#[test]
+fn allocation_failure() {
+    // A collector cannot be created if its thread-local storage cannot be
+    // allocated.
+    let alloc = FailingAlloc::default();
+    alloc.set_failing(true);
+    assert!(Collector::new_in(alloc).is_err());
+
+    let alloc = FailingAlloc::default();
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(2);
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    let guard = collector.enter().unwrap();
+
+    // Retirement fails instead of aborting once the allocator runs dry.
+    alloc.set_failing(true);
+    let value = boxed(DropTrack(dropped.clone()));
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    assert!(unsafe { guard.defer_retire(value, reclaim::boxed) }.is_err());
+
+    // The failed retirement left the pointer untouched, so we still own it.
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+    // Flushing never allocates, so it succeeds even while the allocator is dry.
+    guard.flush();
+
+    // Retirement succeeds again once memory is available.
+    alloc.set_failing(false);
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    unsafe { guard.defer_retire(value, reclaim::boxed) }.unwrap();
+    drop(guard);
+
+    // Dropping the collector reclaims the value without allocating.
+    alloc.set_failing(true);
+    drop(collector);
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn reserve_retire() {
+    let alloc = FailingAlloc::default();
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(1);
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    let guard = collector.enter().unwrap();
+
+    // Reserve a retirement while memory is still available.
+    guard.reserve_retire().unwrap();
+    alloc.set_failing(true);
+
+    // The reserved retirement succeeds despite the allocator being dry.
+    let value = boxed(DropTrack(dropped.clone()));
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    unsafe { guard.defer_retire(value, reclaim::boxed) }.unwrap();
+
+    // The batch was retired, so the next retirement has to allocate, and fails.
+    let value = boxed(DropTrack(dropped.clone()));
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    assert!(unsafe { guard.defer_retire(value, reclaim::boxed) }.is_err());
+
+    // The failed retirement left the value untouched, so we still own it.
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+    // Safety: The retirement failed, so the value was never retired.
+    drop(unsafe { Box::from_raw(value) });
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+    // Dropping the guard reclaims the value that was retired.
+    drop(guard);
+    assert_eq!(dropped.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn reserve_retire_owned() {
+    let alloc = FailingAlloc::default();
+    let collector = Collector::new_in(alloc.clone()).unwrap().batch_size(1);
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    let guard = collector.enter_owned().unwrap();
+    guard.reserve_retire().unwrap();
+    alloc.set_failing(true);
+
+    let value = boxed(DropTrack(dropped.clone()));
+
+    // Safety: The value was never shared, and was allocated with `Box`.
+    unsafe { guard.defer_retire(value, reclaim::boxed) }.unwrap();
+
+    drop(guard);
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
 }
 
 struct DropTrack(Arc<AtomicUsize>);
@@ -30,7 +217,7 @@ unsafe impl<T> Send for UnsafeSend<T> {}
 
 #[test]
 fn single_thread() {
-    let collector = Arc::new(Collector::new().batch_size(2));
+    let collector = Arc::new(Collector::new().unwrap().batch_size(2));
     let dropped = Arc::new(AtomicUsize::new(0));
 
     // multiple of 2
@@ -40,14 +227,14 @@ fn single_thread() {
         let zero = AtomicPtr::new(boxed(DropTrack(dropped.clone())));
 
         {
-            let guard = collector.enter();
+            let guard = collector.enter().unwrap();
             let _ = guard.protect(&zero, Ordering::Relaxed);
         }
 
         {
-            let guard = collector.enter();
+            let guard = collector.enter().unwrap();
             let value = guard.protect(&zero, Ordering::Acquire);
-            unsafe { collector.retire(value, reclaim::boxed) }
+            unsafe { collector.retire(value, reclaim::boxed).unwrap() }
         }
     }
 
@@ -56,7 +243,7 @@ fn single_thread() {
 
 #[test]
 fn two_threads() {
-    let collector = Arc::new(Collector::new().batch_size(3));
+    let collector = Arc::new(Collector::new().unwrap().batch_size(3));
 
     let a_dropped = Arc::new(AtomicUsize::new(0));
     let b_dropped = Arc::new(AtomicUsize::new(0));
@@ -70,7 +257,7 @@ fn two_threads() {
         let collector = collector.clone();
 
         move || {
-            let guard = collector.enter();
+            let guard = collector.enter().unwrap();
             let _value = guard.protect(&one, Ordering::Acquire);
             tx.send(()).unwrap();
             drop(guard);
@@ -80,15 +267,15 @@ fn two_threads() {
 
     for _ in 0..2 {
         let zero = AtomicPtr::new(boxed(DropTrack(b_dropped.clone())));
-        let guard = collector.enter();
+        let guard = collector.enter().unwrap();
         let value = guard.protect(&zero, Ordering::Acquire);
-        unsafe { collector.retire(value, reclaim::boxed) }
+        unsafe { collector.retire(value, reclaim::boxed).unwrap() }
     }
 
     rx.recv().unwrap(); // wait for thread to access value
-    let guard = collector.enter();
+    let guard = collector.enter().unwrap();
     let value = guard.protect(&one, Ordering::Acquire);
-    unsafe { collector.retire(value, reclaim::boxed) }
+    unsafe { collector.retire(value, reclaim::boxed).unwrap() }
 
     rx.recv().unwrap(); // wait for thread to drop guard
     h.join().unwrap();
@@ -106,7 +293,7 @@ fn two_threads() {
 
 #[test]
 fn refresh() {
-    let collector = Arc::new(Collector::new().batch_size(3));
+    let collector = Arc::new(Collector::new().unwrap().batch_size(3));
 
     let items = (0..cfg::ITEMS)
         .map(|i| AtomicPtr::new(boxed(i)))
@@ -119,7 +306,7 @@ fn refresh() {
                 let collector = collector.clone();
 
                 move || {
-                    let mut guard = collector.enter();
+                    let mut guard = collector.enter().unwrap();
 
                     for _ in 0..cfg::ITER {
                         for item in items.iter() {
@@ -137,7 +324,7 @@ fn refresh() {
     for i in 0..cfg::ITER {
         for item in items.iter() {
             let old = item.swap(Box::into_raw(Box::new(i)), Ordering::AcqRel);
-            unsafe { collector.retire(old, reclaim::boxed) }
+            unsafe { collector.retire(old, reclaim::boxed).unwrap() }
         }
     }
 
@@ -148,7 +335,7 @@ fn refresh() {
     // cleanup
     for item in items.iter() {
         let old = item.swap(ptr::null_mut(), Ordering::Acquire);
-        unsafe { collector.retire(old, reclaim::boxed) }
+        unsafe { collector.retire(old, reclaim::boxed).unwrap() }
     }
 }
 
@@ -159,7 +346,7 @@ fn recursive_retire() {
         pointers: Vec<*mut usize>,
     }
 
-    let collector = Collector::new().batch_size(1);
+    let collector = Collector::new().unwrap().batch_size(1);
 
     let ptr = boxed(Recursive {
         _value: 0,
@@ -171,22 +358,22 @@ fn recursive_retire() {
             let value = Box::from_raw(ptr);
 
             for pointer in value.pointers {
-                collector.retire(pointer, reclaim::boxed);
+                collector.retire(pointer, reclaim::boxed).unwrap();
 
-                let mut guard = collector.enter();
+                let mut guard = collector.enter().unwrap();
                 guard.flush();
                 guard.refresh();
                 drop(guard);
             }
-        });
+        }).unwrap();
 
-        collector.enter().flush();
+        collector.enter().unwrap().flush();
     }
 }
 
 #[test]
 fn reclaim_all() {
-    let collector = Collector::new().batch_size(2);
+    let collector = Collector::new().unwrap().batch_size(2);
 
     for _ in 0..cfg::ITER {
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -196,7 +383,7 @@ fn reclaim_all() {
             .collect::<Vec<_>>();
 
         for item in items {
-            unsafe { collector.retire(item.load(Ordering::Relaxed), reclaim::boxed) };
+            unsafe { collector.retire(item.load(Ordering::Relaxed), reclaim::boxed).unwrap() };
         }
 
         unsafe { collector.reclaim_all() };
@@ -212,7 +399,7 @@ fn recursive_retire_reclaim_all() {
     }
 
     unsafe {
-        let collector = Collector::new().batch_size(cfg::ITEMS * 2);
+        let collector = Collector::new().unwrap().batch_size(cfg::ITEMS * 2);
         let dropped = Arc::new(AtomicUsize::new(0));
 
         let ptr = boxed(Recursive {
@@ -225,9 +412,9 @@ fn recursive_retire_reclaim_all() {
         collector.retire(ptr, |ptr: *mut Recursive, collector| {
             let value = Box::from_raw(ptr);
             for pointer in value.pointers {
-                (*collector).retire(pointer, reclaim::boxed);
+                (*collector).retire(pointer, reclaim::boxed).unwrap();
             }
-        });
+        }).unwrap();
 
         collector.reclaim_all();
         assert_eq!(dropped.load(Ordering::Relaxed), cfg::ITEMS);
@@ -236,15 +423,15 @@ fn recursive_retire_reclaim_all() {
 
 #[test]
 fn defer_retire() {
-    let collector = Collector::new().batch_size(5);
+    let collector = Collector::new().unwrap().batch_size(5);
     let dropped = Arc::new(AtomicUsize::new(0));
 
     let objects: Vec<_> = (0..30).map(|_| boxed(DropTrack(dropped.clone()))).collect();
 
-    let guard = collector.enter();
+    let guard = collector.enter().unwrap();
 
     for object in objects {
-        unsafe { guard.defer_retire(object, reclaim::boxed) }
+        unsafe { guard.defer_retire(object, reclaim::boxed).unwrap() }
         guard.flush();
     }
 
@@ -257,7 +444,7 @@ fn defer_retire() {
 
 #[test]
 fn reentrant() {
-    let collector = Arc::new(Collector::new().batch_size(5));
+    let collector = Arc::new(Collector::new().unwrap().batch_size(5));
     let dropped = Arc::new(AtomicUsize::new(0));
 
     let objects: UnsafeSend<Vec<_>> =
@@ -265,17 +452,17 @@ fn reentrant() {
 
     assert_eq!(dropped.load(Ordering::Relaxed), 0);
 
-    let guard1 = collector.enter();
-    let guard2 = collector.enter();
-    let guard3 = collector.enter();
+    let guard1 = collector.enter().unwrap();
+    let guard2 = collector.enter().unwrap();
+    let guard3 = collector.enter().unwrap();
 
     thread::spawn({
         let collector = collector.clone();
 
         move || {
-            let guard = collector.enter();
+            let guard = collector.enter().unwrap();
             for object in { objects }.0 {
-                unsafe { guard.defer_retire(object, reclaim::boxed) }
+                unsafe { guard.defer_retire(object, reclaim::boxed).unwrap() }
             }
         }
     })
@@ -297,17 +484,17 @@ fn reentrant() {
 
     assert_eq!(dropped.load(Ordering::Relaxed), 0);
 
-    let mut guard1 = collector.enter();
-    let mut guard2 = collector.enter();
-    let mut guard3 = collector.enter();
+    let mut guard1 = collector.enter().unwrap();
+    let mut guard2 = collector.enter().unwrap();
+    let mut guard3 = collector.enter().unwrap();
 
     thread::spawn({
         let collector = collector.clone();
 
         move || {
-            let guard = collector.enter();
+            let guard = collector.enter().unwrap();
             for object in { objects }.0 {
-                unsafe { guard.defer_retire(object, reclaim::boxed) }
+                unsafe { guard.defer_retire(object, reclaim::boxed).unwrap() }
             }
         }
     })
@@ -329,19 +516,19 @@ fn reentrant() {
 #[test]
 fn swap_stress() {
     for _ in 0..cfg::ITER {
-        let collector = Collector::new();
+        let collector = Collector::new().unwrap();
         let entries = [const { AtomicPtr::new(ptr::null_mut()) }; cfg::ITEMS];
 
         thread::scope(|s| {
             for _ in 0..cfg::THREADS {
                 s.spawn(|| {
                     for i in 0..cfg::ITEMS {
-                        let guard = collector.enter();
+                        let guard = collector.enter().unwrap();
                         let new = Box::into_raw(Box::new(i));
                         let old = guard.swap(&entries[i], new, Ordering::AcqRel);
                         if !old.is_null() {
                             unsafe { assert_eq!(*old, i) }
-                            unsafe { guard.defer_retire(old, reclaim::boxed) }
+                            unsafe { guard.defer_retire(old, reclaim::boxed).unwrap() }
                         }
                     }
                 });
@@ -358,14 +545,14 @@ fn swap_stress() {
 #[test]
 fn cas_stress() {
     for _ in 0..cfg::ITER {
-        let collector = Collector::new();
+        let collector = Collector::new().unwrap();
         let entries = [const { AtomicPtr::new(ptr::null_mut()) }; cfg::ITEMS];
 
         thread::scope(|s| {
             for _ in 0..cfg::THREADS {
                 s.spawn(|| {
                     for i in 0..cfg::ITEMS {
-                        let guard = collector.enter();
+                        let guard = collector.enter().unwrap();
                         let new = Box::into_raw(Box::new(i));
 
                         loop {
@@ -385,7 +572,7 @@ fn cas_stress() {
 
                             if !old.is_null() {
                                 unsafe { assert_eq!(*old, i) }
-                                unsafe { guard.defer_retire(old, reclaim::boxed) }
+                                unsafe { guard.defer_retire(old, reclaim::boxed).unwrap() }
                             }
 
                             break;
@@ -404,7 +591,7 @@ fn cas_stress() {
 
 #[test]
 fn owned_guard() {
-    let collector = Collector::new().batch_size(5);
+    let collector = Collector::new().unwrap().batch_size(5);
     let dropped = Arc::new(AtomicUsize::new(0));
 
     let objects = UnsafeSend(
@@ -416,11 +603,11 @@ fn owned_guard() {
     assert_eq!(dropped.load(Ordering::Relaxed), 0);
 
     thread::scope(|s| {
-        let guard1 = collector.enter_owned();
+        let guard1 = collector.enter_owned().unwrap();
 
-        let guard2 = collector.enter();
+        let guard2 = collector.enter().unwrap();
         for object in objects.0.iter() {
-            unsafe { guard2.defer_retire(object.load(Ordering::Acquire), reclaim::boxed) }
+            unsafe { guard2.defer_retire(object.load(Ordering::Acquire), reclaim::boxed).unwrap() }
         }
 
         drop(guard2);
@@ -445,7 +632,7 @@ fn owned_guard() {
 
 #[test]
 fn owned_guard_concurrent() {
-    let collector = Collector::new().batch_size(1);
+    let collector = Collector::new().unwrap().batch_size(1);
     let dropped = Arc::new(AtomicUsize::new(0));
 
     let objects = UnsafeSend(
@@ -454,7 +641,7 @@ fn owned_guard_concurrent() {
             .collect::<Vec<_>>(),
     );
 
-    let guard = collector.enter_owned();
+    let guard = collector.enter_owned().unwrap();
     let barrier = Barrier::new(cfg::THREADS);
 
     thread::scope(|s| {
@@ -467,7 +654,7 @@ fn owned_guard_concurrent() {
             s.spawn(move || {
                 barrier.wait();
 
-                unsafe { guard.defer_retire(objects.0[i].load(Ordering::Acquire), reclaim::boxed) };
+                unsafe { guard.defer_retire(objects.0[i].load(Ordering::Acquire), reclaim::boxed).unwrap() };
 
                 guard.flush();
 
@@ -486,18 +673,18 @@ fn owned_guard_concurrent() {
 
 #[test]
 fn collector_equality() {
-    let a = Collector::new();
-    let b = Collector::new();
+    let a = Collector::new().unwrap();
+    let b = Collector::new().unwrap();
 
     assert_eq!(a, a);
     assert_eq!(b, b);
     assert_ne!(a, b);
 
-    assert_eq!(*a.enter().collector(), a);
-    assert_ne!(*a.enter().collector(), b);
+    assert_eq!(*a.enter().unwrap().collector(), a);
+    assert_ne!(*a.enter().unwrap().collector(), b);
 
-    assert_eq!(*b.enter().collector(), b);
-    assert_ne!(*b.enter().collector(), a);
+    assert_eq!(*b.enter().unwrap().collector(), b);
+    assert_ne!(*b.enter().unwrap().collector(), a);
 }
 
 #[test]
@@ -508,21 +695,21 @@ fn stress() {
 
         thread::scope(|s| {
             for i in 0..cfg::ITEMS {
-                stack.push(i, &stack.collector.enter());
-                stack.pop(&stack.collector.enter());
+                stack.push(i, &stack.collector.enter().unwrap());
+                stack.pop(&stack.collector.enter().unwrap());
             }
 
             for _ in 0..cfg::THREADS {
                 s.spawn(|| {
                     for i in 0..cfg::ITEMS {
-                        stack.push(i, &stack.collector.enter());
-                        stack.pop(&stack.collector.enter());
+                        stack.push(i, &stack.collector.enter().unwrap());
+                        stack.pop(&stack.collector.enter().unwrap());
                     }
                 });
             }
         });
 
-        assert!(stack.pop(&stack.collector.enter()).is_none());
+        assert!(stack.pop(&stack.collector.enter().unwrap()).is_none());
         assert!(stack.is_empty());
     }
 }
@@ -532,7 +719,7 @@ fn shared_owned_stress() {
     // all threads sharing an owned guard
     for _ in 0..cfg::ITER {
         let stack = Arc::new(Stack::new(1));
-        let guard = &stack.collector.enter_owned();
+        let guard = &stack.collector.enter_owned().unwrap();
 
         thread::scope(|s| {
             for i in 0..cfg::ITEMS {
@@ -564,7 +751,7 @@ fn owned_stress() {
 
         thread::scope(|s| {
             for i in 0..cfg::ITEMS {
-                let guard = &stack.collector.enter_owned();
+                let guard = &stack.collector.enter_owned().unwrap();
                 stack.push(i, guard);
                 stack.pop(guard);
             }
@@ -572,7 +759,7 @@ fn owned_stress() {
             for _ in 0..cfg::THREADS {
                 s.spawn(|| {
                     for i in 0..cfg::ITEMS {
-                        let guard = &stack.collector.enter_owned();
+                        let guard = &stack.collector.enter_owned().unwrap();
                         stack.push(i, guard);
                         stack.pop(guard);
                     }
@@ -580,7 +767,7 @@ fn owned_stress() {
             }
         });
 
-        assert!(stack.pop(&stack.collector.enter_owned()).is_none());
+        assert!(stack.pop(&stack.collector.enter_owned().unwrap()).is_none());
         assert!(stack.is_empty());
     }
 }
@@ -601,7 +788,7 @@ impl<T> Stack<T> {
     pub fn new(batch_size: usize) -> Stack<T> {
         Stack {
             head: AtomicPtr::new(ptr::null_mut()),
-            collector: Collector::new().batch_size(batch_size),
+            collector: Collector::new().unwrap().batch_size(batch_size),
         }
     }
 
@@ -642,7 +829,7 @@ impl<T> Stack<T> {
             {
                 unsafe {
                     let data = ptr::read(&(*head).data);
-                    self.collector.retire(head, reclaim::boxed);
+                    self.collector.retire(head, reclaim::boxed).unwrap();
                     return Some(ManuallyDrop::into_inner(data));
                 }
             }
@@ -656,7 +843,7 @@ impl<T> Stack<T> {
 
 impl<T> Drop for Stack<T> {
     fn drop(&mut self) {
-        let guard = self.collector.enter();
+        let guard = self.collector.enter().unwrap();
         while self.pop(&guard).is_some() {}
     }
 }

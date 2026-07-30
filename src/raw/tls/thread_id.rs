@@ -37,8 +37,21 @@ impl ThreadIdManager {
     }
 
     /// Free a thread ID for reuse.
+    ///
+    /// Note that IDs are freed from thread destructors, which have nowhere to
+    /// report an allocation failure. Reserving space immediately before pushing
+    /// guarantees that the push itself cannot grow the heap, allowing us to
+    /// simply decline to recycle the ID if we are out of memory, instead of
+    /// aborting.
+    ///
+    /// An ID that is not recycled leaves the ID space slightly sparser, which
+    /// may cause a `ThreadLocal` to allocate larger buckets than it otherwise
+    /// would have. Note that this is not sticky: every call reserves for itself,
+    /// so recycling resumes as soon as memory is available again.
     fn free(&mut self, id: usize) {
-        self.free_list.push(Reverse(id));
+        if self.free_list.try_reserve(1).is_ok() {
+            self.free_list.push(Reverse(id));
+        }
     }
 }
 
@@ -180,6 +193,23 @@ impl Drop for ThreadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recycle_ids() {
+        let mut manager = ThreadIdManager::default();
+
+        assert_eq!(manager.alloc(), 0);
+        assert_eq!(manager.alloc(), 1);
+        assert_eq!(manager.alloc(), 2);
+
+        manager.free(2);
+        manager.free(0);
+
+        // Freed IDs are reused, smallest first.
+        assert_eq!(manager.alloc(), 0);
+        assert_eq!(manager.alloc(), 2);
+        assert_eq!(manager.alloc(), 3);
+    }
 
     #[test]
     fn thread() {
