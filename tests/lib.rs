@@ -1079,11 +1079,14 @@ fn budget_exhaustion() {
     assert_eq!(dropped.load(Ordering::Relaxed), 1);
 
     // Nor does the collector abort on a thread it has never seen before, which
-    // has neither thread-local storage nor a retirement batch.
-    thread::scope(|s| {
+    // has neither thread-local storage nor a retirement batch. Note that which
+    // of the two allocations the thread needs fails first depends on how much
+    // memory the collector happened to reserve, so the thread reports whether
+    // it got far enough to create a value.
+    let created = thread::scope(|s| {
         s.spawn(|| {
             let Ok(guard) = collector.enter() else {
-                return;
+                return false;
             };
 
             let value = boxed(DropTrack(dropped.clone()));
@@ -1093,10 +1096,15 @@ fn budget_exhaustion() {
 
             // Safety: The retirement failed, so the value was never retired.
             drop(unsafe { Box::from_raw(value) });
-        });
+
+            true
+        })
+        .join()
+        .unwrap()
     });
 
-    assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    let dropped_so_far = 1 + created as usize;
+    assert_eq!(dropped.load(Ordering::Relaxed), dropped_so_far);
 
     // Retirement succeeds again once memory is available.
     alloc.set_budget(usize::MAX);
@@ -1108,7 +1116,7 @@ fn budget_exhaustion() {
     drop(guard);
     drop(collector);
 
-    assert_eq!(dropped.load(Ordering::Relaxed), 3);
+    assert_eq!(dropped.load(Ordering::Relaxed), dropped_so_far + 1);
     assert_eq!(alloc.live(), 0);
 }
 
