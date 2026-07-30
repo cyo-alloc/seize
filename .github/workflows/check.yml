@@ -12,8 +12,9 @@ permissions:
 # built once.
 on:
   push:
-    branches: [master]
+    branches: [master, cyo-alloc]
   pull_request:
+  workflow_dispatch:
 # If new code is pushed to a PR branch, then cancel in progress workflows for that PR. Ensures that
 # we don't waste CI time, and returns results quicker https://github.com/jonhoo/rust-ci-conf/pull/5
 concurrency:
@@ -62,6 +63,10 @@ jobs:
   semver:
     runs-on: ubuntu-latest
     name: semver
+    # This fork intentionally makes breaking changes to the published API, so a
+    # semver violation against the crates.io baseline is expected rather than a
+    # failure. The job still runs, to report what changed.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
