@@ -1,0 +1,17 @@
+[package]
+name = "linux-nolibc"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+seize = { path = "../..", default-features = false }
+rustix = { version = "1", default-features = false, features = ["thread"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

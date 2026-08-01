@@ -1,0 +1,11 @@
+# A freestanding Linux binary: no C runtime objects, no default libraries,
+# statically linked at a fixed address. Everything the binary needs — entry
+# point, allocator, `mem*` functions, syscalls — is provided in `main.rs`.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-args=-nostartfiles -nodefaultlibs -static",
+]

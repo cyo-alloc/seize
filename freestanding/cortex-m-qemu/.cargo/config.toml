@@ -1,0 +1,10 @@
+# Cortex-M4 without an FPU dependency: the soft-float ABI keeps qemu happy
+# regardless of whether the FPU was enabled at boot, and the ISA is still the
+# thumbv7em floor from the README. `cargo run` boots the binary in qemu; the
+# exit code comes back through semihosting.
+[build]
+target = "thumbv7em-none-eabi"
+
+[target.thumbv7em-none-eabi]
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=--nmagic"]
+runner = "qemu-system-arm -cpu cortex-m4 -machine mps2-an386 -nographic -semihosting-config enable=on,target=native -kernel"
