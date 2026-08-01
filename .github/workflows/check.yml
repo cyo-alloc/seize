@@ -93,6 +93,25 @@ jobs:
       # --feature-powerset runs for every combination of features
       - name: cargo hack
         run: cargo hack --feature-powerset check
+  no-std:
+    # check that the crate really is `core` + `alloc` by building it for a
+    # freestanding target, which has no `std` to fall back on
+    runs-on: ubuntu-latest
+    name: ubuntu / stable / no-std
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [thumbv7em-none-eabihf, riscv32imac-unknown-none-elf]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: cargo build --no-default-features --target ${{ matrix.target }}
+        run: cargo build --no-default-features --target ${{ matrix.target }}
   msrv:
     # check that we can build using the minimal rust version that is specified by this crate
     runs-on: ubuntu-latest
@@ -100,7 +119,7 @@ jobs:
     # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
     strategy:
       matrix:
-        msrv: ["1.72.0"]
+        msrv: ["1.85.0"]
     name: ubuntu / ${{ matrix.msrv }}
     steps:
       - uses: actions/checkout@v4
@@ -112,3 +131,5 @@ jobs:
           toolchain: ${{ matrix.msrv }}
       - name: cargo +${{ matrix.msrv }} check
         run: cargo check
+      - name: cargo +${{ matrix.msrv }} check --no-default-features
+        run: cargo check --no-default-features

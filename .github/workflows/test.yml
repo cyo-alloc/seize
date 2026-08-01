@@ -43,6 +43,11 @@ jobs:
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --all-features --doc
+
+      # The `core` + `alloc` build has its own reclamation path and its own
+      # synchronization primitives, exercised by the `owned_guard` suite.
+      - name: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
   os-check:
     # run cargo test on mac and windows
     runs-on: ${{ matrix.os }}
@@ -84,3 +89,42 @@ jobs:
         uses: taiki-e/install-action@cargo-minimal-versions
       - name: cargo minimal-versions test
         run: cargo minimal-versions test --all-features --all-targets
+
+  freestanding:
+    # Build and RUN the `no_std` configuration on real targets: a Cortex-M4
+    # under qemu, covering the spin-latch mode on the thumbv7em ISA, and a
+    # libc-free Linux binary whose host lock makes raw futex syscalls through
+    # rustix, covering the registered-lock mode. The linux binary must also
+    # have no dynamic linkage at all.
+    runs-on: ubuntu-latest
+    name: ubuntu / stable / freestanding
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+      - name: Install qemu
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: run the cortex-m tests under qemu
+        working-directory: freestanding/cortex-m-qemu
+        run: cargo run --release
+      - name: build the no-libc linux tests
+        working-directory: freestanding/linux-nolibc
+        run: cargo build --release
+      - name: check that no libc is linked, dynamically or statically
+        run: |
+          BIN=freestanding/linux-nolibc/target/x86_64-unknown-linux-gnu/release/linux-nolibc
+          if readelf --dynamic "$BIN" | grep NEEDED; then
+            echo "the binary links against a shared library"
+            exit 1
+          fi
+          if nm "$BIN" | grep -iE "__libc|__glibc"; then
+            echo "the binary contains statically linked libc code"
+            exit 1
+          fi
+      - name: run the no-libc linux tests
+        run: ./freestanding/linux-nolibc/target/x86_64-unknown-linux-gnu/release/linux-nolibc

@@ -69,3 +69,7 @@ jobs:
           components: miri
       - name: cargo miri test
         run: cargo miri test
+      # The `core` + `alloc` configuration has its own lock delegation and
+      # spin fallback; run its suite under miri as well.
+      - name: cargo miri test --no-default-features
+        run: cargo miri test --no-default-features
