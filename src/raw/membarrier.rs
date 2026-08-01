@@ -36,7 +36,7 @@ pub use default::*;
     miri
 ))]
 mod default {
-    use core::sync::atomic::{fence, Ordering};
+    use core::sync::atomic::{Ordering, fence};
 
     pub fn detect() {}
 
@@ -212,7 +212,7 @@ mod linux {
         use std::cell::UnsafeCell;
         use std::mem::MaybeUninit;
         use std::ptr;
-        use std::sync::{atomic, OnceLock};
+        use std::sync::{OnceLock, atomic};
 
         struct Barrier {
             lock: UnsafeCell<libc::pthread_mutex_t>,

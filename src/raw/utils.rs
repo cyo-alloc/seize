@@ -35,7 +35,7 @@ pub struct CachePadded<T> {
     pub value: T,
 }
 
-impl<T> std::ops::Deref for CachePadded<T> {
+impl<T> core::ops::Deref for CachePadded<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -43,7 +43,7 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for CachePadded<T> {
+impl<T> core::ops::DerefMut for CachePadded<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.value
     }

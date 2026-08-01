@@ -61,10 +61,49 @@ be; this resolves as soon as memory is available again. And `seize` still
 panics on thread-ID exhaustion (after `2^64` thread creations) and on lock
 poisoning.
 
+## No-std
+
+`seize` builds without an operating system, as `core` + `alloc`, by disabling
+the default `std` feature. This is for a freestanding target that is still
+genuinely concurrent — several cores, or an RTOS with preemptive tasks — not
+for removing the cost of concurrency on a single-threaded one.
+
+What changes is where a thread slot comes from. With `std`, `Collector::enter`
+looks one up in thread-local storage. Without it there is no thread-local
+storage, so the slot is owned explicitly: `Collector::enter_owned` allocates
+one and frees it when the guard is dropped. The guard is `Send`, and is meant
+to live in whatever handle the host uses to represent a worker. Everything
+gated on `std` — `LocalGuard`, `Collector::enter`, and the two
+current-thread retirement methods `Collector::retire` and
+`Collector::reserve_retire` — has an `OwnedGuard` equivalent.
+
+Locking becomes the host's job. `seize` ships no lock protocol of its own
+without `std`: its two internal locks are delegated to whatever the host
+registers through [`seize::lock`] — an `acquire`/`release` pair over an
+opaque key, registered once at startup. A Zig host hands over a
+`std.Thread.Mutex` in four lines; an RTOS hands over its native mutex and
+gets priority inheritance for free. If nothing is registered by the time the
+first lock is taken, `seize` latches onto a built-in test-and-set spin lock,
+which is correct but can deadlock a strictly priority-scheduled single core;
+the locks are only taken when a thread slot is allocated or freed and when an
+`OwnedGuard` is mutated, so one guard per worker up front never contends them.
+And the collector sizes its initial thread-local storage from
+`available_parallelism`, which does not exist here, so it starts from one and
+grows on demand — pass a `batch_size` if the default of `32` does not suit the
+part.
+
+The target floor is real atomic compare-and-swap: `thumbv7em`,
+`thumbv8m.main`, `riscv32imac` and up. `thumbv6m` (Cortex-M0/M0+) has no CAS
+and is not supported. Nothing in the crate uses 64-bit atomics, so 32-bit
+targets are fine. Fast memory barriers are a Linux and Windows optimization,
+so `fast-barrier` implies `std`; without it, heavy barriers are a plain
+`SeqCst` fence, which costs performance rather than correctness.
+
 [quick-start guide]: https://docs.rs/seize/latest/seize/guide/index.html
 [hazard pointers]:
   https://www.cs.otago.ac.nz/cosc440/readings/hazard-pointers.pdf
 [`Allocator`]: https://docs.rs/seize/latest/seize/alloc/trait.Allocator.html
+[`seize::lock`]: https://docs.rs/seize/latest/seize/lock/index.html
 [hyaline reclamation scheme]: https://arxiv.org/pdf/1905.07903.pdf
 [epoch based reclamation]:
   https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf

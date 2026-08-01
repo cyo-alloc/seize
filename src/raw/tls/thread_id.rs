@@ -5,23 +5,31 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::cell::Cell;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::sync::{Mutex, OnceLock};
+use crate::sync::Mutex;
+use alloc_crate::collections::BinaryHeap;
+#[cfg(feature = "std")]
+use core::cell::Cell;
+use core::cmp::Reverse;
 
 /// An allocator for thread IDs.
 ///
 /// The allocator attempts to aggressively reuse thread IDs where possible to
 /// avoid cases where a `ThreadLocal` grows indefinitely when it is used by many
 /// short-lived threads.
-#[derive(Default)]
 struct ThreadIdManager {
     free_from: usize,
     free_list: BinaryHeap<Reverse<usize>>,
 }
 
 impl ThreadIdManager {
+    /// Create an empty thread ID manager.
+    const fn new() -> ThreadIdManager {
+        ThreadIdManager {
+            free_from: 0,
+            free_list: BinaryHeap::new(),
+        }
+    }
+
     /// Allocate a new thread ID.
     fn alloc(&mut self) -> usize {
         if let Some(id) = self.free_list.pop() {
@@ -55,11 +63,8 @@ impl ThreadIdManager {
     }
 }
 
-/// Returns a reference to the global thread ID manager.
-fn thread_id_manager() -> &'static Mutex<ThreadIdManager> {
-    static THREAD_ID_MANAGER: OnceLock<Mutex<ThreadIdManager>> = OnceLock::new();
-    THREAD_ID_MANAGER.get_or_init(Default::default)
-}
+/// The global thread ID manager.
+static THREAD_ID_MANAGER: Mutex<ThreadIdManager> = Mutex::new(ThreadIdManager::new());
 
 /// A unique identifier for a slot in a triangular vector, such as
 /// `ThreadLocal`.
@@ -129,6 +134,11 @@ impl Thread {
     }
 
     /// Get the current thread.
+    ///
+    /// This requires thread-local storage, and so an operating system. Without
+    /// one, a thread slot is instead owned explicitly, by an
+    /// [`OwnedGuard`](crate::OwnedGuard).
+    #[cfg(feature = "std")]
     #[inline]
     pub fn current() -> Thread {
         THREAD.with(|thread| {
@@ -141,6 +151,7 @@ impl Thread {
     }
 
     /// Slow path for allocating a thread ID.
+    #[cfg(feature = "std")]
     #[cold]
     #[inline(never)]
     fn init_slow(thread: &Cell<Option<Thread>>) -> Thread {
@@ -152,7 +163,7 @@ impl Thread {
 
     /// Create a new thread.
     pub fn create() -> Thread {
-        Thread::new(thread_id_manager().lock().unwrap().alloc())
+        Thread::new(THREAD_ID_MANAGER.lock().alloc())
     }
 
     /// Free the given thread.
@@ -161,7 +172,7 @@ impl Thread {
     ///
     /// This function must only be called once on a given thread.
     pub unsafe fn free(id: usize) {
-        thread_id_manager().lock().unwrap().free(id);
+        THREAD_ID_MANAGER.lock().free(id);
     }
 }
 
@@ -169,16 +180,20 @@ impl Thread {
 // thread is initialized without having to register a thread-local destructor.
 //
 // This makes the fast path smaller.
-thread_local! { static THREAD: Cell<Option<Thread>> = const { Cell::new(None) }; }
-thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: Cell::new(0) } }; }
+#[cfg(feature = "std")]
+std::thread_local! { static THREAD: Cell<Option<Thread>> = const { Cell::new(None) }; }
+#[cfg(feature = "std")]
+std::thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: Cell::new(0) } }; }
 
 // Guard to ensure the thread ID is released on thread exit.
+#[cfg(feature = "std")]
 struct ThreadGuard {
     // We keep a copy of the thread ID in the `ThreadGuard`: we can't reliably access
     // `THREAD` in our `Drop` impl due to the unpredictable order of TLS destructors.
     id: Cell<usize>,
 }
 
+#[cfg(feature = "std")]
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
         // Release the thread ID. Any further accesses to the thread ID will go through
@@ -196,7 +211,7 @@ mod tests {
 
     #[test]
     fn recycle_ids() {
-        let mut manager = ThreadIdManager::default();
+        let mut manager = ThreadIdManager::new();
 
         assert_eq!(manager.alloc(), 0);
         assert_eq!(manager.alloc(), 1);

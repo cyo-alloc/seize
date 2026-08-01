@@ -3,10 +3,10 @@ use super::tls::{Thread, ThreadLocal};
 use super::utils::CachePadded;
 use crate::alloc::{AllocError, Box, DynAlloc, Vec};
 
-use std::cell::{Cell, UnsafeCell};
-use std::ptr;
-use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use crate::sync::Mutex;
+use core::cell::{Cell, UnsafeCell};
+use core::ptr;
+use core::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 
 /// Fast and efficient concurrent memory reclamation.
 ///
@@ -211,7 +211,7 @@ impl Collector {
 
         // Safety: `fn(*mut T) and fn(*mut U)` are ABI compatible if `T, U: Sized`.
         let reclaim: unsafe fn(*mut (), &crate::Collector) =
-            unsafe { std::mem::transmute(reclaim) };
+            unsafe { core::mem::transmute(reclaim) };
 
         // Safety: The caller guarantees we have unique access to the batch.
         let len = unsafe {

@@ -5,7 +5,8 @@
 //! glue. See [the guide](crate#custom-reclaimers) for details about memory
 //! reclamation, and writing custom reclaimers.
 
-use std::ptr;
+use alloc_crate::boxed::Box;
+use core::ptr;
 
 use crate::Collector;
 

@@ -1,9 +1,13 @@
+use crate::OwnedGuard;
 use crate::alloc::{AllocError, Allocator, DynAlloc};
-use crate::raw::{self, membarrier, Thread};
-use crate::{LocalGuard, OwnedGuard};
+use crate::raw::{self, membarrier};
 
-use std::fmt;
-use std::sync::OnceLock;
+#[cfg(feature = "std")]
+use crate::LocalGuard;
+#[cfg(feature = "std")]
+use crate::raw::Thread;
+
+use core::fmt;
 
 /// A concurrent garbage collector.
 ///
@@ -58,7 +62,7 @@ impl Collector {
     /// use seize::Collector;
     ///
     /// let collector = Collector::new_in(Global).unwrap();
-    /// # let _ = collector.enter().unwrap();
+    /// # let _ = collector.enter_owned().unwrap();
     /// ```
     ///
     /// # Errors
@@ -79,12 +83,22 @@ impl Collector {
         membarrier::detect();
 
         // available_parallelism is quite slow (microseconds).
-        static CPUS: OnceLock<usize> = OnceLock::new();
-        let cpus = *CPUS.get_or_init(|| {
-            std::thread::available_parallelism()
-                .map(Into::into)
-                .unwrap_or(1)
-        });
+        #[cfg(feature = "std")]
+        let cpus = {
+            static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *CPUS.get_or_init(|| {
+                std::thread::available_parallelism()
+                    .map(Into::into)
+                    .unwrap_or(1)
+            })
+        };
+
+        // Without an operating system there is nothing to ask, so we start
+        // from one. Note that this is only the initial capacity of the
+        // collector's thread-local storage, which grows on demand, and the
+        // floor for the batch size, which `batch_size` can override.
+        #[cfg(not(feature = "std"))]
+        let cpus = 1;
 
         // Ensure every batch accumulates at least as many entries
         // as there are threads on the system.
@@ -170,6 +184,15 @@ impl Collector {
     /// }
     /// # unsafe { drop(Box::from_raw(ptr.load(Ordering::Relaxed))) };
     /// ```
+    ///
+    /// # Availability
+    ///
+    /// This method requires the `std` feature, as a local guard is looked up in
+    /// thread-local storage. Without an operating system, use
+    /// [`enter_owned`](Collector::enter_owned) instead and keep the guard in
+    /// whatever handle represents the worker.
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[inline]
     pub fn enter(&self) -> Result<LocalGuard<'_>, AllocError> {
         LocalGuard::enter(self)
@@ -203,6 +226,16 @@ impl Collector {
     /// # Errors
     ///
     /// Returns an error if the retirement batch could not be allocated.
+    ///
+    /// # Availability
+    ///
+    /// This method requires the `std` feature, as it targets the current
+    /// thread's retirement batch, which is looked up in thread-local storage.
+    /// Without an operating system, use
+    /// [`Guard::reserve_retire`](crate::Guard::reserve_retire) on an
+    /// [`OwnedGuard`], which targets the batch that guard owns.
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[inline]
     pub fn reserve_retire(&self) -> Result<(), AllocError> {
         // Safety: `Thread::current` is the current thread.
@@ -276,6 +309,16 @@ impl Collector {
     ///         .unwrap();
     /// }
     /// ```
+    ///
+    /// # Availability
+    ///
+    /// This method requires the `std` feature, as it targets the current
+    /// thread's retirement batch, which is looked up in thread-local storage.
+    /// Without an operating system, use
+    /// [`Guard::defer_retire`](crate::Guard::defer_retire) on an
+    /// [`OwnedGuard`], which targets the batch that guard owns.
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[inline]
     pub unsafe fn retire<T>(
         &self,

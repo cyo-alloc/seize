@@ -9,11 +9,11 @@ mod thread_id;
 
 use crate::alloc::{self, AllocError, DynAlloc, Layout};
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::ptr::NonNull;
-use std::sync::atomic::{self, AtomicBool, AtomicPtr, Ordering};
-use std::{mem, ptr};
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+use core::sync::atomic::{self, AtomicBool, AtomicPtr, Ordering};
+use core::{mem, ptr};
 
 pub use thread_id::Thread;
 
@@ -95,7 +95,7 @@ impl<T> ThreadLocal<T> {
 
     /// Create a `ThreadLocal` container with the given initial capacity,
     /// allocating in the global allocator.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub fn with_capacity(capacity: usize) -> ThreadLocal<T> {
         ThreadLocal::with_capacity_in(capacity, DynAlloc::Global).unwrap()
     }
@@ -181,7 +181,7 @@ impl<T> ThreadLocal<T> {
 
     /// Load the entry for the current thread, returning `None` if it has not
     /// been initialized.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     fn try_load(&self) -> Option<&T> {
         // Safety: Loading with `Thread::current` is always sound.
         unsafe { self.get(Thread::current()) }
@@ -401,7 +401,8 @@ unsafe fn free_bucket<T>(alloc: &DynAlloc, bucket: *mut Entry<T>, capacity: usiz
     };
 }
 
-#[cfg(test)]
+// These tests exercise `Thread::current`, and so require thread-local storage.
+#[cfg(all(test, feature = "std"))]
 #[allow(clippy::redundant_closure)]
 mod tests {
     use super::*;

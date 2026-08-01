@@ -1,10 +1,12 @@
-use std::fmt;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, Ordering};
+#[cfg(feature = "std")]
+use core::fmt;
+#[cfg(feature = "std")]
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::Collector;
 use crate::alloc::AllocError;
 use crate::raw::{self, Reservation, Thread};
-use crate::Collector;
 
 /// A guard that enables protected loads of concurrent objects.
 ///
@@ -190,6 +192,8 @@ pub trait Guard {
 ///
 /// Most of the functionality provided by this type is through the [`Guard`]
 /// trait.
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub struct LocalGuard<'a> {
     /// The collector that this guard is associated with.
     collector: &'a Collector,
@@ -205,6 +209,7 @@ pub struct LocalGuard<'a> {
     _unsend: PhantomData<*mut ()>,
 }
 
+#[cfg(feature = "std")]
 impl LocalGuard<'_> {
     #[inline]
     pub(crate) fn enter(collector: &Collector) -> Result<LocalGuard<'_>, AllocError> {
@@ -232,6 +237,7 @@ impl LocalGuard<'_> {
     }
 }
 
+#[cfg(feature = "std")]
 impl Guard for LocalGuard<'_> {
     /// Refreshes the guard.
     #[inline]
@@ -290,6 +296,7 @@ impl Guard for LocalGuard<'_> {
     }
 }
 
+#[cfg(feature = "std")]
 impl Drop for LocalGuard<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -307,6 +314,7 @@ impl Drop for LocalGuard<'_> {
     }
 }
 
+#[cfg(feature = "std")]
 impl fmt::Debug for LocalGuard<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("LocalGuard").finish()
@@ -387,7 +395,7 @@ impl Guard for OwnedGuard<'_> {
     fn flush(&self) {
         // Safety: `self.reservation` is owned by the current thread.
         let reservation = unsafe { &*self.reservation };
-        let _lock = reservation.lock.lock().unwrap();
+        let _lock = reservation.lock.lock();
         // Note that this does not actually retire any values, it just attempts to add
         // the batch to any active reservations lists, including ours.
         //
@@ -404,11 +412,24 @@ impl Guard for OwnedGuard<'_> {
     /// Returns a numeric identifier for the current thread.
     #[inline]
     fn thread_id(&self) -> usize {
-        // We can't return the ID of our thread slot because `OwnedGuard` is `Send` so
-        // the ID is not uniquely tied to the current thread. We also can't
-        // return the OS thread ID because it might conflict with our thread
-        // IDs, so we have to get/create the current thread.
-        Thread::current().id
+        #[cfg(feature = "std")]
+        {
+            // We can't return the ID of our thread slot because `OwnedGuard` is `Send`
+            // so the ID is not uniquely tied to the current thread. We also
+            // can't return the OS thread ID because it might conflict with our
+            // thread IDs, so we have to get/create the current thread.
+            Thread::current().id
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            // Without an operating system there is no current thread to ask about, so
+            // we return the ID of the slot this guard owns instead. That is a
+            // correct identifier as long as the guard is not shared between
+            // workers, which is the arrangement this configuration is built
+            // for: one guard per worker, held for as long as the worker lives.
+            self.thread.id
+        }
     }
 
     /// Reserves space for a single deferred retirement.
@@ -416,7 +437,7 @@ impl Guard for OwnedGuard<'_> {
     fn reserve_retire(&self) -> Result<(), AllocError> {
         // Safety: `self.reservation` is owned by the current thread.
         let reservation = unsafe { &*self.reservation };
-        let _lock = reservation.lock.lock().unwrap();
+        let _lock = reservation.lock.lock();
 
         // Safety: We hold the lock and so have unique access to the batch.
         unsafe { self.collector.raw.reserve(self.thread) }
@@ -432,7 +453,7 @@ impl Guard for OwnedGuard<'_> {
     ) -> Result<(), AllocError> {
         // Safety: `self.reservation` is owned by the current thread.
         let reservation = unsafe { &*self.reservation };
-        let _lock = reservation.lock.lock().unwrap();
+        let _lock = reservation.lock.lock();
 
         // Safety:
         // - We hold the lock and so have unique access to the batch.

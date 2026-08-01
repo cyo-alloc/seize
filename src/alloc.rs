@@ -19,9 +19,9 @@
 //! returns a [`Result`], and leaves the collector unchanged if allocation
 //! fails.
 
-use std::fmt;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use alloc_crate::sync::Arc;
+use core::fmt;
+use core::ptr::NonNull;
 
 pub use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 

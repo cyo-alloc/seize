@@ -1,14 +1,14 @@
 [package]
 name = "seize"
 version = "0.5.1"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 authors = ["Ibraheem Ahmed <ibraheem@ibraheem.ca>"]
 description = "Fast, efficient, and predictable memory reclamation for concurrent data structures."
 repository = "https://github.com/ibraheemdev/seize"
 keywords = ["lock-free", "rcu", "atomic", "garbage", "concurrency"]
 categories = ["concurrency", "memory-management"]
-rust-version = "1.72.0"
+rust-version = "1.85.0"
 
 [dependencies]
 allocator-api2 = { version = "0.4.0", default-features = false, features = ["alloc"] }
@@ -18,10 +18,21 @@ libc = { version = "0.2", optional = true }
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_System_Threading"], optional = true }
 
 [features]
-default = ["fast-barrier"]
+default = ["std", "fast-barrier"]
+
+# Enables the parts of the crate that require an operating system: thread-local
+# storage, and so `LocalGuard` and `Collector::enter`.
+#
+# Without it the crate is `core` + `alloc`, and reclamation is driven through
+# `OwnedGuard`, which owns its thread slot rather than looking one up.
+std = []
 
 # Enables runtime detection of fast memory barriers on Linux and Windows.
-fast-barrier = ["windows-sys", "libc"]
+fast-barrier = ["std", "windows-sys", "libc"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
 criterion = "0.7.0"
@@ -29,12 +40,24 @@ crossbeam-epoch = "0.9.8"
 haphazard = "0.1.8"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(seize_asan)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(seize_asan)', 'cfg(docsrs)'] }
+
+# The `lib` test suite and the benchmarks use `Collector::enter`, and so require
+# the `std` feature. `owned_guard` covers the `core` + `alloc` API surface, and
+# builds under either configuration.
+[[test]]
+name = "lib"
+required-features = ["std"]
+
+[[test]]
+name = "owned_guard"
 
 [[bench]]
 name = "stack"
 harness = false
+required-features = ["std"]
 
 [[bench]]
 name = "single_thread"
 harness = false
+required-features = ["std"]
