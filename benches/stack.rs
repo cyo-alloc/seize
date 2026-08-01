@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 const THREADS: usize = 16;
 const ITEMS: usize = 1000;
@@ -68,7 +68,7 @@ criterion_main!(benches);
 
 mod seize_stack {
     use super::Stack;
-    use seize::{reclaim, Collector, Guard};
+    use seize::{Collector, Guard, reclaim};
     use std::mem::ManuallyDrop;
     use std::ptr::{self, NonNull};
     use std::sync::atomic::{AtomicPtr, Ordering};

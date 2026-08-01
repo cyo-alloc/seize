@@ -1,11 +1,11 @@
 use seize::alloc::{AllocError, Allocator, Global, Layout};
-use seize::{reclaim, Collector, Guard};
+use seize::{Collector, Guard, reclaim};
 
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 
 #[test]
